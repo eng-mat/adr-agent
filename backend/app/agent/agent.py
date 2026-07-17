@@ -10,6 +10,7 @@ from typing import Any
 
 from app.agent.tools import TOOLS, dispatch
 from app.llm.provider import get_provider
+from app.services import config_store
 from app.skills.loader import skills_as_prompt
 
 BASE_SYSTEM = """You are the **ADR Agent** for the **Cloud Engineering** team. You turn a
@@ -47,8 +48,31 @@ that is the target cloud. Never apply one cloud's skill to another cloud's ADR.
 """
 
 
+def _references_block() -> str:
+    refs = config_store.references()
+    if not refs:
+        return ""
+    lines = ["===== CANONICAL REFERENCE SOURCES ====="]
+    lines.append(
+        "These are the org's authoritative source-of-truth links (kept updated by the "
+        "Security / Architecture / Engineering teams). In an ADR's References section, "
+        "cite the ones whose scope is 'global' or matches the ADR's cloud — never another "
+        "cloud's link."
+    )
+    for r in refs:
+        scope = (r.get("scope") or "global").lower()
+        cat = r.get("category", "other")
+        title = r.get("title") or r.get("url")
+        lines.append(f"- [{scope}/{cat}] {title}: {r.get('url')}")
+    return "\n".join(lines)
+
+
 def system_prompt() -> str:
-    return BASE_SYSTEM + "\n\n" + skills_as_prompt()
+    parts = [BASE_SYSTEM, skills_as_prompt()]
+    refs = _references_block()
+    if refs:
+        parts.append(refs)
+    return "\n\n".join(parts)
 
 
 def run_turn(messages: list[dict[str, Any]], max_steps: int = 8) -> dict[str, Any]:

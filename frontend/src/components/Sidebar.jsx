@@ -2,7 +2,7 @@ import { useState } from "react";
 import { api } from "../api";
 import Modal from "./Modal.jsx";
 
-export default function Sidebar({ catalog, skills, knowledge, onPickService }) {
+export default function Sidebar({ catalog, skills, knowledge, references, onPickService }) {
   const [tab, setTab] = useState("catalog");
   const [doc, setDoc] = useState(null);
 
@@ -26,6 +26,7 @@ export default function Sidebar({ catalog, skills, knowledge, onPickService }) {
         {tab === "knowledge" && (
           <Knowledge
             knowledge={knowledge}
+            references={references}
             onOpen={async (k) => {
               const d = await api.knowledgeDoc(k.key);
               setDoc({ title: k.title, content: d.content });
@@ -116,7 +117,7 @@ function Skills({ skills }) {
   );
 }
 
-function Knowledge({ knowledge, onOpen }) {
+function Knowledge({ knowledge, references, onOpen }) {
   return (
     <div className="knowledge">
       <p className="hint">
@@ -132,6 +133,24 @@ function Knowledge({ knowledge, onOpen }) {
           <span className="doc-title">{k.title}</span>
         </button>
       ))}
+
+      {references && references.length > 0 && (
+        <>
+          <div className="section-label">Reference Sources</div>
+          <p className="hint">
+            Canonical links (Confluence & other) the agent cites in ADRs. Admins manage these.
+          </p>
+          {references.map((r, i) => (
+            <a key={i} className="doc-item" href={r.url} target="_blank" rel="noreferrer">
+              <span className="doc-topic">
+                <span className={`scope-tag ${r.scope || "global"}`}>{r.scope || "global"}</span>
+                <span>{r.category}</span>
+              </span>
+              <span className="doc-title">{r.title} ↗</span>
+            </a>
+          ))}
+        </>
+      )}
     </div>
   );
 }

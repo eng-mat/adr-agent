@@ -51,6 +51,7 @@ export const api = {
   skills: (scope) => req(`/skills${scope ? `?scope=${scope}` : ""}`),
   knowledge: (scope) => req(`/knowledge${scope ? `?scope=${scope}` : ""}`),
   knowledgeDoc: (key) => req(`/knowledge/${key}`),
+  references: () => req("/references"),
 
   // auth
   login: (email, name, role) =>

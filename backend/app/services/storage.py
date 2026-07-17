@@ -99,6 +99,12 @@ def save_adr(
     updates: dict = {}
     if content.author in ("", "Cloud Engineering", "ADR Agent"):
         updates["author"] = config_store.author()
+    # Attach the admin-configured reference links (scoped to this cloud) when the agent
+    # didn't provide its own — so every ADR/KT cites the canonical source-of-truth pages.
+    if not content.references:
+        cfg_refs = config_store.references_as_lines(cloud_slug)
+        if cfg_refs:
+            updates["references"] = cfg_refs
     # Auto-fill the IaC hint if the agent didn't supply one.
     if not content.iac.strip():
         updates["iac"] = iac_hint_markdown(

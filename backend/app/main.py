@@ -93,6 +93,11 @@ def get_skills(scope: str | None = None) -> dict:
     }
 
 
+@app.get("/api/references")
+def get_references() -> dict:
+    return {"references": config_store.references()}
+
+
 @app.get("/api/knowledge")
 def get_knowledge_list(scope: str | None = None) -> dict:
     return {"docs": knowledge.list_docs(scope)}

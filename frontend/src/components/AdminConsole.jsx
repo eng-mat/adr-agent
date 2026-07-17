@@ -3,10 +3,14 @@ import { api } from "../api";
 
 const TABS = [
   { key: "integrations", label: "Integrations" },
+  { key: "references", label: "Reference Links" },
   { key: "general", label: "General" },
   { key: "knowledge", label: "Knowledge" },
   { key: "skills", label: "Skills" },
 ];
+
+const REF_CATEGORIES = ["security", "architecture", "engineering", "other"];
+const REF_SCOPES = ["global", "aws", "gcp", "azure"];
 
 export default function AdminConsole({ onClose, onChanged }) {
   const [tab, setTab] = useState("integrations");
@@ -30,6 +34,7 @@ export default function AdminConsole({ onClose, onChanged }) {
       </div>
       <div className="admin-body">
         {tab === "integrations" && <Integrations onChanged={onChanged} />}
+        {tab === "references" && <ReferencesAdmin />}
         {tab === "general" && <General onChanged={onChanged} />}
         {tab === "knowledge" && <KnowledgeAdmin />}
         {tab === "skills" && <SkillsAdmin />}
@@ -322,6 +327,97 @@ function SkillsAdmin() {
                 <span className="doc-name">🧩 {s.name}</span>
                 <span className="doc-desc">{s.description}</span>
                 <button className="del-btn" onClick={() => del(s.scope, s.name)} title="Delete">✕</button>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReferencesAdmin() {
+  const [cfg, setCfg] = useState(null);
+  const [refs, setRefs] = useState([]);
+  const [form, setForm] = useState({ title: "", category: "security", scope: "global", url: "" });
+  const [msg, setMsg] = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  const load = () =>
+    api.adminConfig().then((c) => {
+      setCfg(c);
+      setRefs(c.references || []);
+    }).catch((e) => setMsg(e.message));
+  useEffect(() => { load(); }, []);
+  if (!cfg) return <div className="admin-loading">Loading…</div>;
+
+  async function persist(next) {
+    const res = await api.adminUpdateConfig({ references: next });
+    setCfg(res);
+    setRefs(res.references || []);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1800);
+  }
+  async function add() {
+    setMsg(null);
+    if (!form.title.trim() || !form.url.trim()) return setMsg("Title and URL are required.");
+    if (!/^https?:\/\//i.test(form.url.trim())) return setMsg("URL should start with http:// or https://");
+    await persist([...refs, { ...form, title: form.title.trim(), url: form.url.trim() }]);
+    setForm({ ...form, title: "", url: "" });
+  }
+  async function del(i) {
+    await persist(refs.filter((_, idx) => idx !== i));
+  }
+
+  const grouped = {};
+  for (let i = 0; i < refs.length; i++) (grouped[refs[i].scope || "global"] ||= []).push({ ...refs[i], i });
+
+  return (
+    <div className="admin-section">
+      <div className="card">
+        <div className="card-title"><h3>Add a reference link</h3></div>
+        <p className="card-sub">
+          Canonical source-of-truth pages (Confluence or other) that Security, Architecture,
+          and Engineering keep updated. The agent cites the ones matching each ADR's cloud in
+          its <strong>References</strong> section. Scope <code>global</code> applies to every cloud.
+        </p>
+        <div className="row">
+          <Field label="Category">
+            <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
+              {REF_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </Field>
+          <Field label="Scope (cloud)">
+            <select value={form.scope} onChange={(e) => setForm({ ...form, scope: e.target.value })}>
+              {REF_SCOPES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </Field>
+        </div>
+        <Field label="Title">
+          <input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="e.g. Cloud Security Standard" />
+        </Field>
+        <Field label="URL (internal)">
+          <input value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} placeholder="https://your-org.atlassian.net/wiki/…" />
+        </Field>
+        {msg && <div className="admin-error">{msg}</div>}
+        <div className="admin-actions">
+          <button className="primary" onClick={add}>Add link</button>
+          <Saved show={saved} />
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-title"><h3>Reference links ({refs.length})</h3></div>
+        {refs.length === 0 && <p className="card-sub">None yet. Add your Confluence and other source links above.</p>}
+        {Object.entries(grouped).map(([scope, items]) => (
+          <div key={scope} className="doc-group">
+            <div className="doc-group-head"><span className={`scope-tag ${scope}`}>{scope}</span></div>
+            {items.map((r) => (
+              <div key={r.i} className="doc-line">
+                <span className="doc-cat">{r.category}</span>
+                <span className="doc-name">{r.title}</span>
+                <a className="doc-desc ref-url" href={r.url} target="_blank" rel="noreferrer">{r.url}</a>
+                <button className="del-btn" onClick={() => del(r.i)} title="Delete">✕</button>
               </div>
             ))}
           </div>

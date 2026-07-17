@@ -21,6 +21,7 @@ export default function Workspace({ health }) {
   const [catalog, setCatalog] = useState([]);
   const [skills, setSkills] = useState([]);
   const [knowledge, setKnowledge] = useState([]);
+  const [references, setReferences] = useState([]);
   const [adrs, setAdrs] = useState([]);
   const [activeAdrId, setActiveAdrId] = useState(null);
   const [seed, setSeed] = useState(null);
@@ -39,6 +40,7 @@ export default function Workspace({ health }) {
     api.catalog().then((r) => setCatalog(r.clouds)).catch(() => {});
     api.skills().then((r) => setSkills(r.skills)).catch(() => {});
     api.knowledge().then((r) => setKnowledge(r.docs)).catch(() => {});
+    api.references().then((r) => setReferences(r.references)).catch(() => {});
     refreshAdrs().catch(() => {});
   }, [refreshAdrs]);
 
@@ -103,7 +105,7 @@ export default function Workspace({ health }) {
     <div className={`layout ${isNarrow ? "narrow" : ""}`}>
       {!collapsed.left && (
         <div className="pane pane-left" style={leftStyle}>
-          <Sidebar catalog={catalog} skills={skills} knowledge={knowledge} onPickService={requestService} />
+          <Sidebar catalog={catalog} skills={skills} knowledge={knowledge} references={references} onPickService={requestService} />
         </div>
       )}
 

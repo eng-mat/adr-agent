@@ -25,6 +25,11 @@ def _defaults() -> dict[str, Any]:
     return {
         "author": "Cloud Engineering",
         "admin_emails": [],
+        # Canonical source-of-truth links (Confluence & others) that the
+        # Security / Architecture / Engineering teams keep updated. Each:
+        #   {"title": str, "category": security|architecture|engineering|other,
+        #    "scope": global|aws|gcp|azure, "url": str}
+        "references": [],
         "github": {
             "token": settings.github_token,
             "repo": settings.github_repo,
@@ -80,6 +85,30 @@ def author() -> str:
 
 def admin_emails() -> list[str]:
     return [e.strip().lower() for e in effective().get("admin_emails", []) if e.strip()]
+
+
+def references() -> list[dict]:
+    return [r for r in effective().get("references", []) if r.get("url")]
+
+
+def references_for(cloud: str | None) -> list[dict]:
+    """Reference links that apply to a given cloud: global + that cloud's."""
+    out = []
+    for r in references():
+        scope = (r.get("scope") or "global").lower()
+        if scope in ("global", cloud):
+            out.append(r)
+    return out
+
+
+def references_as_lines(cloud: str | None) -> list[str]:
+    """Formatted 'Title (category) — url' lines for an ADR/KT References section."""
+    lines = []
+    for r in references_for(cloud):
+        cat = r.get("category", "other")
+        title = r.get("title") or r["url"]
+        lines.append(f"{title} ({cat}) — {r['url']}")
+    return lines
 
 
 def public() -> dict[str, Any]:
