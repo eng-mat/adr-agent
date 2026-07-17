@@ -1,0 +1,16 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+backend/.env
+backend/.local-mirror/
+# Admin runtime config may hold GitHub/Confluence tokens — never commit
+backend/data/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
