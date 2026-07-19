@@ -409,17 +409,41 @@ gcloud compute target-https-proxies create "$APP-proxy" \
 gcloud compute addresses create "$APP-vip" --region="$REGION" --subnet="$SUBNET"
 export LB_IP="$(gcloud compute addresses describe "$APP-vip" --region="$REGION" --format='value(address)')"
 
-# forwarding rule — global access lets on-prem/other regions reach it
+# forwarding rule — private VIP, HTTPS only
 gcloud compute forwarding-rules create "$APP-fr" \
   --region="$REGION" --load-balancing-scheme=INTERNAL_MANAGED \
   --network="$VPC" --subnet="$SUBNET" --address="$LB_IP" \
   --target-https-proxy="$APP-proxy" --target-https-proxy-region="$REGION" \
-  --ports=443 --allow-global-access
+  --ports=443
 
 echo "LB VIP: $LB_IP"
 ```
 
 > **HTTPS only.** No HTTP forwarding rule is created, so there is no port-80 listener at all.
+
+### Do you need `--allow-global-access`?
+
+**This flag has nothing to do with public/internet access.** The VIP is a private RFC1918
+address; no external IP exists either way. The flag only controls whether clients in **other
+GCP regions** — including on-prem traffic arriving via an Interconnect/VPN attached in a
+*different* region — may reach it.
+
+On-prem clients are treated as being in the region of their **VLAN attachment / Cloud Router**:
+
+```bash
+gcloud compute interconnects attachments list --format="table(name,region,router)"
+```
+
+| Attachment region vs `$REGION` | Action |
+|---|---|
+| **Same region** | Leave it off (as above). Least exposure. |
+| **Different region** | Add `--allow-global-access`, or on-prem traffic can't reach the VIP. |
+
+To add it later without recreating the rule:
+
+```bash
+gcloud compute forwarding-rules update "$APP-fr" --region="$REGION" --allow-global-access
+```
 
 ---
 
@@ -466,6 +490,38 @@ Confirm there is **no** public exposure:
 ```bash
 gcloud run services describe "$SERVICE" --region="$REGION" \
   --format='value(status.url, spec.template.metadata.annotations)'   # url should be empty
+```
+
+---
+
+## 13b. Why the outside world cannot see this app
+
+Five independent layers, any one of which alone would block public access:
+
+| # | Layer | Effect |
+|---|---|---|
+| 1 | **No public DNS record** | The name lives only in a Cloud DNS **private** zone (`--visibility=private`). Public resolvers return NXDOMAIN for `myapp.beta.matextechplus.com`. Clicking the link from outside resolves to nothing. |
+| 2 | **Private VIP** | The LB is `INTERNAL_MANAGED` with an RFC1918 address from your subnet. No external IP is ever allocated — there is no internet-routable target. |
+| 3 | **Cloud Run ingress** | `internal-and-cloud-load-balancing` rejects anything not from your VPC or the internal LB. |
+| 4 | **No default URL** | `--no-default-url` removes the `*.run.app` hostname entirely, so the usual public backdoor doesn't exist. |
+| 5 | **Firewall** | Ingress to :443 is restricted to `$ONPREM_CIDR`. |
+
+⚠️ **The one thing that would break this:** if `matextechplus.com` also has a **public** Cloud DNS
+zone (or public registrar records) and someone adds `myapp.beta` there. Keep the record in the
+private zone only. Verify from outside your network:
+
+```bash
+# should return NXDOMAIN / no answer from a public resolver
+dig +short myapp.beta.matextechplus.com @8.8.8.8
+nslookup myapp.beta.matextechplus.com 1.1.1.1
+```
+
+Also confirm the service itself has no public URL:
+
+```bash
+gcloud run services describe "$SERVICE" --region="$REGION" --format='value(status.url)'   # empty
+gcloud compute forwarding-rules describe "$APP-fr" --region="$REGION" \
+  --format='value(loadBalancingScheme,IPAddress)'   # INTERNAL_MANAGED + private IP
 ```
 
 ---
