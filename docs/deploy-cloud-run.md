@@ -8,7 +8,7 @@ values in the table below.
 
 | | Where | What |
 |---|---|---|
-| **Host project** | `my-host-project` | Networking is **already in place**. You only *verify* things and grant IAM. Nothing here is created except the DNS record. |
+| **Host project** | `my-host-project` | Networking is **already in place**. You only *verify* things and grant IAM — nothing is created here. |
 | **Service project** | `my-service-project` | Everything you create: KMS, Artifact Registry, GCS, Secret Manager, service accounts, Cloud Run, and all load balancer components. |
 | **Cloud Build** | service project | **Builds and pushes the image only.** It has no `run.admin` and cannot deploy. |
 | **Cloud Run deploy** | you, manually | §9 |
@@ -16,7 +16,10 @@ values in the table below.
 Assumptions confirmed for this environment:
 - Zscaler egress **routes and firewall rules already exist** — you only attach the network tag.
 - A **proxy-only subnet already exists** in the region — do not create another.
-- **DNS forwarder addresses are already configured** per subnet — you only look them up.
+- **DNS is handled by the org's self-service portal** (§11), exactly as for GKE: reserve a
+  static IP, map a custom name to it, submit. No Cloud DNS zone or record is created.
+- The hostname is a **private-only name** (e.g. `myapp.adr.agent`), not a public domain — so
+  the certificate must come from the **internal CA** (§10a).
 
 ---
 
@@ -32,7 +35,7 @@ Assumptions confirmed for this environment:
 | `my-existing-subnet` | Existing app subnet (in the host project) |
 | `zscaler-egress` | Existing network tag that routes egress to Zscaler — **confirm the real one in §7c** |
 | `10.0.0.0/8` | On-prem CIDR allowed to reach the LB |
-| `myapp.beta.matextechplus.com` | Internal FQDN |
+| `myapp.adr.agent` | Internal FQDN |
 
 Point gcloud at the service project (host-project commands pass `--project` explicitly):
 
@@ -46,7 +49,7 @@ gcloud config set project my-service-project
 
 ```
  on-prem laptop
-      │  DNS: myapp.beta.matextechplus.com → internal LB VIP (private)
+      │  self-service DNS: myapp.adr.agent → LB VIP (private)
       │  Interconnect / VPN
       ▼
  ┌─ host project: my-host-project ──────────────┐
@@ -54,7 +57,6 @@ gcloud config set project my-service-project
  │   • my-existing-subnet   (shared)            │
  │   • proxy-only subnet    (exists)            │
  │   • Zscaler routes + firewall (exist)        │
- │   • DNS forwarder addresses (exist)          │
  └───────────────────┬──────────────────────────┘
                      │ subnets shared to
  ┌─ service project: my-service-project ────────┐
@@ -402,9 +404,12 @@ gcloud compute networks subnets add-iam-policy-binding my-existing-subnet \
 > You (the operator) also need `roles/compute.networkUser` on this subnet, plus the ability to
 > create the DNS record in §11.
 
-### 7f. Look up the existing DNS forwarder addresses
+### 7f. DNS — nothing to do here
 
-These are already configured per subnet — just note them for the corporate DNS team:
+Name resolution is handled by the **organization's self-service DNS portal** (§11), the same
+way you do it for GKE. No Cloud DNS zone, record, or inbound forwarding policy is needed.
+
+For reference only, the pre-existing per-subnet DNS forwarder addresses can be listed with:
 
 ```bash
 gcloud compute addresses list \
@@ -413,8 +418,7 @@ gcloud compute addresses list \
   --format="table(name,region,address,subnetwork)"
 ```
 
-The address in `us-central1` on your subnet is what on-prem DNS conditionally forwards
-`matextechplus.com` to.
+You only need these if you ever bypass the self-service portal and resolve via Cloud DNS.
 
 ---
 
@@ -485,8 +489,15 @@ gcloud run deploy adr-agent \
 
 ### 10a. Certificate (Venafi-issued)
 
-Obtain the certificate for `myapp.beta.matextechplus.com` from Venafi. Put the **leaf first,
-then intermediates** in `cert.pem` and the key in `key.pem`:
+Request the certificate for the **exact name you will register in §11** — e.g. `myapp.adr.agent`
+— with that name in the **SAN** field (browsers ignore CN and match on SAN).
+
+> ⚠️ **Internal CA required.** Public CAs cannot issue for a non-public name like
+> `myapp.adr.agent` (there's no domain to validate). It must be issued by your **internal CA**,
+> and your laptop must already trust that CA's root — which it will if it's the corporate root
+> pushed by group policy. This is the same CA path your GKE Istio certs use.
+
+Put the **leaf first, then intermediates** in `cert.pem` and the key in `key.pem`:
 
 ```bash
 gcloud compute ssl-certificates create adr-agent-cert \
@@ -585,58 +596,62 @@ gcloud compute forwarding-rules update adr-agent-fr --region=us-central1 --allow
 
 ---
 
-## 11. DNS — myapp.beta.matextechplus.com (host project)
+## 11. DNS — register the name in the org self-service portal
 
-Private zones attach to the VPC, so the zone lives in the **host project**.
+**No gcloud commands here.** This mirrors the GKE flow: you reserve a static IP, then map a
+custom name to it in the organization's self-service DNS portal. Cloud DNS is not used.
 
-Check whether the zone already exists:
-
-```bash
-gcloud dns managed-zones list --project=my-host-project --filter="dnsName:matextechplus.com."
-```
-
-Create it only if missing:
+### 11a. Get the static VIP you reserved
 
 ```bash
-gcloud dns managed-zones create matextechplus-private \
-  --project=my-host-project \
-  --dns-name=matextechplus.com. \
-  --visibility=private \
-  --networks=my-vpc \
-  --description="Internal zone"
+gcloud compute addresses describe adr-agent-vip --region=us-central1 --format='value(address)'
 ```
 
-Add the A record pointing at the VIP from §10e (substitute the real address):
+### 11b. Submit the mapping in the self-service portal
+
+| Field | Value |
+|---|---|
+| **Custom name** | `myapp.adr.agent` |
+| **IP address** | the address printed above (e.g. `10.10.0.25`) |
+| **Type** | A record |
+
+Same as GKE — except there you register the Istio/LB static IP; here you register the
+**internal ALB VIP**. Submit and wait for it to propagate.
+
+### 11c. Confirm it resolves (from on-prem)
 
 ```bash
-gcloud dns record-sets create myapp.beta.matextechplus.com. \
-  --project=my-host-project \
-  --zone=matextechplus-private \
-  --type=A \
-  --ttl=300 \
-  --rrdatas=10.10.0.25
+nslookup myapp.adr.agent
 ```
 
-On-prem resolution uses the **existing** DNS forwarder address from §7f — give it to the
-corporate DNS team as the conditional forwarder target for `matextechplus.com`.
+> **Naming note.** A private-only name like `myapp.adr.agent` has no public DNS delegation at
+> all, so it can never resolve outside your network — this is *stronger* isolation than a
+> subdomain of a real domain such as `matextechplus.com`, where a stray public record would
+> expose it. If your org lets you choose the suffix, `.internal` is formally reserved by ICANN
+> for private use and can never collide with a future public gTLD. Otherwise follow whatever
+> namespace the self-service portal manages.
+
+> ⚠️ **The certificate must match this exact name** — see §10a. A public CA **cannot** issue a
+> certificate for a non-public name like `myapp.adr.agent`; it must come from your internal CA
+> (which is what Venafi typically fronts).
 
 ---
 
 ## 12. Verify from an on-prem laptop
 
 ```bash
-nslookup myapp.beta.matextechplus.com
+nslookup myapp.adr.agent
 ```
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' https://myapp.beta.matextechplus.com/api/health
+curl -sS -o /dev/null -w '%{http_code}\n' https://myapp.adr.agent/api/health
 ```
 
 ```bash
-curl -sS https://myapp.beta.matextechplus.com/api/health
+curl -sS https://myapp.adr.agent/api/health
 ```
 
-Then open **https://myapp.beta.matextechplus.com** in the browser and sign in.
+Then open **https://myapp.adr.agent** in the browser and sign in.
 
 ---
 
@@ -644,19 +659,21 @@ Then open **https://myapp.beta.matextechplus.com** in the browser and sign in.
 
 | # | Layer | Effect |
 |---|---|---|
-| 1 | **No public DNS record** | The name exists only in a **private** zone. Public resolvers return NXDOMAIN — an outsider clicking the link resolves nothing. |
-| 2 | **Private VIP** | `INTERNAL_MANAGED` with an RFC1918 address. No external IP is ever allocated. |
-| 3 | **Cloud Run ingress** | `internal-and-cloud-load-balancing` rejects anything not from the VPC or the internal LB. |
-| 4 | **No default URL** | `--no-default-url` removes the `*.run.app` hostname — the usual public backdoor doesn't exist. |
-| 5 | **Firewall** | Ingress on :443 restricted to `10.0.0.0/8`. |
+| 1 | **Non-public name** | `myapp.adr.agent` has no public DNS delegation anywhere in the world — no registrar, no zone, nothing to look up. It cannot resolve from the internet even in principle. |
+| 2 | **Internal-only resolution** | The mapping lives solely in the org's self-service DNS, reachable from the corporate network. |
+| 3 | **Private VIP** | `INTERNAL_MANAGED` with an RFC1918 address. No external IP is ever allocated. |
+| 4 | **Cloud Run ingress** | `internal-and-cloud-load-balancing` rejects anything not from the VPC or the internal LB. |
+| 5 | **No default URL** | `--no-default-url` removes the `*.run.app` hostname — the usual public backdoor doesn't exist. |
+| 6 | **Firewall** | Ingress on :443 restricted to `10.0.0.0/8`. |
 
-⚠️ `matextechplus.com` is a real public domain. If a `myapp.beta` record is ever added to the
-**public** zone or registrar, layer 1 collapses. Keep it in the private zone only.
+✅ A private-only name like `myapp.adr.agent` **eliminates** the main risk a real domain would
+carry — someone accidentally publishing the record in the public zone. There is no public zone
+to publish into. This is stronger isolation than `something.matextechplus.com` would give you.
 
 Verify from **off** the corporate network:
 
 ```bash
-dig +short myapp.beta.matextechplus.com @8.8.8.8
+dig +short myapp.adr.agent @8.8.8.8
 ```
 
 Confirm the service has no public URL (output should be empty):
@@ -682,8 +699,9 @@ Find-and-replace the values from the table at the top, then run the same command
 3. **KMS location** must match the region for every CMEK resource.
 4. **Proxy-only subnet** — confirm one exists (§7b); create it only if that org lacks one.
 5. **Zscaler tag** — the tag name differs per environment; re-run §7c to find it.
-6. **DNS forwarder** — re-run §7f; the addresses differ per environment.
-7. **Venafi** — certificate issuance and renewal process.
+6. **Self-service DNS** — each org has its own portal; register the new VIP there (§11).
+7. **Venafi / internal CA** — the certificate SAN must match the custom name you register in
+   that org, and the laptops must trust that CA's root.
 
 ---
 
@@ -729,7 +747,9 @@ gcloud compute target-https-proxies update adr-agent-proxy \
 | Agent fails calling Gemini | `all-traffic` egress with no path to Google APIs — see the note in §7c |
 | LB returns 502 | NEG region mismatch, or ingress not `internal-and-cloud-load-balancing` |
 | On-prem cannot reach the VIP | Interconnect lands in another region — add `--allow-global-access` (§10e) |
-| Name doesn't resolve on-prem | Conditional forwarder not pointed at the §7f address |
+| Name doesn't resolve on-prem | Self-service DNS mapping not submitted or not yet propagated (§11) |
+| `NET::ERR_CERT_COMMON_NAME_INVALID` | Certificate SAN doesn't match the registered name — reissue for the exact custom name (§10a) |
+| Cert issued by public CA rejected | A public CA cannot sign a private-only name — reissue from the internal CA (§10a) |
 | ADRs disappear after a restart | Volume mount or env vars missing — `ADR_OUTPUT_DIR` must be under `/data` |
 | Browser certificate warning | `cert.pem` missing intermediates, or the corporate root isn't trusted on the laptop |
 
