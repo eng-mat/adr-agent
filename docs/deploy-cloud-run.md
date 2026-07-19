@@ -1,79 +1,61 @@
 # Deploying the ADR Agent to Cloud Run (internal, CMEK, hybrid on-prem access)
 
-A parameterized runbook. Set the variables in **§1**, then run each section in order.
-Everything is written to be re-runnable in a second organization by changing only §1.
+Run these commands **one after another, top to bottom**. Every command uses literal values —
+no shell variables, no scripts. To reuse this in another organization, find-and-replace the
+values in the table below.
+
+**Division of labour:** Cloud Build **only builds and pushes the image** to Artifact Registry.
+**You deploy Cloud Run manually** (§9). The build service account deliberately has no
+`run.admin`, so the pipeline cannot touch production.
+
+---
+
+## Values to find-and-replace
+
+| Placeholder in this doc | Meaning |
+|---|---|
+| `my-project-id` | GCP project ID |
+| `123456789012` | Project **number** — `gcloud projects describe my-project-id --format='value(projectNumber)'` |
+| `us-central1` | Region (must match your existing subnet + KMS) |
+| `my-vpc` | Existing VPC network |
+| `my-existing-subnet` | Existing app subnet (Direct VPC egress + LB VIP) |
+| `zscaler-egress` | Network tag that routes egress to Zscaler |
+| `10.0.0.0/8` | On-prem CIDR allowed to reach the LB |
+| `myapp.beta.matextechplus.com` | Internal FQDN |
+
+Set the project once so you don't repeat `--project` everywhere:
+
+```bash
+gcloud config set project my-project-id
+gcloud config set compute/region us-central1
+```
+
+---
 
 ## Target architecture
 
 ```
  on-prem laptop
-      │  (DNS: myapp.beta.matextechplus.com  →  internal LB VIP)
+      │  DNS: myapp.beta.matextechplus.com → internal LB VIP (private)
       │  Interconnect / VPN
       ▼
  ┌──────────────────────────────────────────────┐
- │ VPC (existing subnet)                        │
- │                                              │
+ │ VPC: my-vpc                                  │
  │  Internal Application LB (HTTPS :443)        │
- │   • regional, proxy-only subnet              │
- │   • Venafi-issued cert                       │
- │   • --allow-global-access (on-prem reach)    │
+ │   • existing proxy-only subnet               │
+ │   • Venafi cert                              │
  │            │ serverless NEG                  │
  │            ▼                                 │
- │  Cloud Run service (INTERNAL ingress only)   │
- │   • CMEK encrypted, no default run.app URL   │
- │   • Direct VPC egress + network tag          │
- │   • GCS volume mount (CMEK) for persistence  │
- │   • Secrets from Secret Manager (CMEK)       │
- │            │ egress (tag: zscaler-egress)    │
+ │  Cloud Run (INTERNAL ingress, no public URL) │
+ │   • CMEK · GCS volume (CMEK) · Secret Mgr    │
+ │            │ egress tag: zscaler-egress      │
  │            ▼ route → Zscaler → GitHub        │
  └──────────────────────────────────────────────┘
 ```
 
-**Why `--allow-unauthenticated` is still safe here:** with `--ingress=internal-and-cloud-load-balancing`
-the service is unreachable from the internet — the network is the boundary. Cloud Run IAM auth
-can't be used for browser traffic behind an ALB (the LB doesn't mint ID tokens), so user identity
-is handled by the app's own login/SSO. If you later want an identity gate at the edge, add IAP.
-
 ---
 
-## 1. Variables
-
-```bash
-# ---- identity / location ----
-export PROJECT_ID="my-project"
-export PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-export REGION="us-central1"
-
-# ---- existing network (already in place) ----
-export VPC="my-vpc"
-export SUBNET="my-existing-subnet"            # app subnet (Direct VPC egress + LB VIP)
-export PROXY_SUBNET="proxy-only-$REGION"      # NEW, required by the internal ALB
-export PROXY_CIDR="10.30.0.0/24"              # must not overlap anything
-export NET_TAG="zscaler-egress"               # network tag driving egress to Zscaler
-export ONPREM_CIDR="10.0.0.0/8"               # on-prem ranges allowed to reach the LB
-
-# ---- naming ----
-export APP="adr-agent"
-export SERVICE="$APP"
-export AR_REPO="$APP"
-export BUCKET="$PROJECT_ID-$APP-data"
-export KMS_RING="$APP-ring"
-export KMS_KEY="$APP-key"
-export BUILD_SA="$APP-build@$PROJECT_ID.iam.gserviceaccount.com"
-export RUN_SA="$APP-run@$PROJECT_ID.iam.gserviceaccount.com"
-export IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/$APP:v1"
-
-# ---- DNS ----
-export DNS_ZONE="matextechplus-private"
-export DNS_NAME="matextechplus.com."
-export FQDN="myapp.beta.matextechplus.com"
-
-gcloud config set project "$PROJECT_ID"
-```
-
----
-
-## 2. Enable APIs
+## 1. Enable APIs
 
 ```bash
 gcloud services enable \
@@ -88,480 +70,638 @@ gcloud services enable \
   iam.googleapis.com
 ```
 
-> **Org-policy check (do this first in a new org).** These commonly block the build:
-> `constraints/run.allowedIngress`, `constraints/gcp.restrictNonCmekServices`,
-> `constraints/iam.disableServiceAccountKeyCreation`, `constraints/compute.vmExternalIpAccess`,
-> `constraints/cloudbuild.allowedIntegrations`. Verify with:
-> `gcloud resource-manager org-policies list --project=$PROJECT_ID`
+Check for org policies that commonly block this build (do this first in a new org):
+
+```bash
+gcloud resource-manager org-policies list --project=my-project-id
+```
+
+Watch for: `constraints/run.allowedIngress`, `constraints/gcp.restrictNonCmekServices`,
+`constraints/compute.restrictSharedVpcSubnetworks`, domain-restricted sharing.
 
 ---
 
-## 3. KMS — one CMEK key for everything
+## 2. KMS — one CMEK key for everything
 
-The key must live in the **same region** as the resources it protects.
+The key must be in the **same region** as the resources it protects.
 
 ```bash
-gcloud kms keyrings create "$KMS_RING" --location="$REGION"
+gcloud kms keyrings create adr-agent-ring --location=us-central1
+```
 
-gcloud kms keys create "$KMS_KEY" \
-  --location="$REGION" --keyring="$KMS_RING" \
+```bash
+gcloud kms keys create adr-agent-key \
+  --location=us-central1 \
+  --keyring=adr-agent-ring \
   --purpose=encryption \
-  --rotation-period=90d --next-rotation-time="$(date -u -d '+90 days' +%Y-%m-%dT%H:%M:%SZ)"
-
-export KEY="projects/$PROJECT_ID/locations/$REGION/keyRings/$KMS_RING/cryptoKeys/$KMS_KEY"
+  --rotation-period=90d \
+  --next-rotation-time=2026-10-17T00:00:00Z
 ```
 
 ### Grant each Google service agent use of the key
-CMEK is applied by **service agents**, not your SA. Missing any of these is the #1 failure.
+
+CMEK is applied by **service agents**, not by your own service accounts. A missing grant here
+is the single most common cause of deploy failures.
+
+Create the service identities first (no-ops if they already exist):
 
 ```bash
-# Cloud Run
-gcloud kms keys add-iam-policy-binding "$KMS_KEY" \
-  --location="$REGION" --keyring="$KMS_RING" \
-  --member="serviceAccount:service-$PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com" \
-  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+gcloud beta services identity create --service=artifactregistry.googleapis.com --project=my-project-id
+gcloud beta services identity create --service=secretmanager.googleapis.com --project=my-project-id
+```
 
-# Artifact Registry
-gcloud beta services identity create --service=artifactregistry.googleapis.com --project="$PROJECT_ID"
-gcloud kms keys add-iam-policy-binding "$KMS_KEY" \
-  --location="$REGION" --keyring="$KMS_RING" \
-  --member="serviceAccount:service-$PROJECT_NUMBER@gcp-sa-artifactregistry.iam.gserviceaccount.com" \
-  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+Cloud Run:
 
-# Cloud Storage
-export GCS_AGENT="$(gcloud storage service-agent --project=$PROJECT_ID)"
-gcloud kms keys add-iam-policy-binding "$KMS_KEY" \
-  --location="$REGION" --keyring="$KMS_RING" \
-  --member="serviceAccount:$GCS_AGENT" \
+```bash
+gcloud kms keys add-iam-policy-binding adr-agent-key \
+  --location=us-central1 --keyring=adr-agent-ring \
+  --member=serviceAccount:service-123456789012@serverless-robot-prod.iam.gserviceaccount.com \
   --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+```
 
-# Secret Manager
-gcloud beta services identity create --service=secretmanager.googleapis.com --project="$PROJECT_ID"
-gcloud kms keys add-iam-policy-binding "$KMS_KEY" \
-  --location="$REGION" --keyring="$KMS_RING" \
-  --member="serviceAccount:service-$PROJECT_NUMBER@gcp-sa-secretmanager.iam.gserviceaccount.com" \
+Artifact Registry:
+
+```bash
+gcloud kms keys add-iam-policy-binding adr-agent-key \
+  --location=us-central1 --keyring=adr-agent-ring \
+  --member=serviceAccount:service-123456789012@gcp-sa-artifactregistry.iam.gserviceaccount.com \
+  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+```
+
+Cloud Storage (print the agent first, then grant it):
+
+```bash
+gcloud storage service-agent --project=my-project-id
+```
+
+```bash
+gcloud kms keys add-iam-policy-binding adr-agent-key \
+  --location=us-central1 --keyring=adr-agent-ring \
+  --member=serviceAccount:service-123456789012@gs-project-accounts.iam.gserviceaccount.com \
+  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+```
+
+Secret Manager:
+
+```bash
+gcloud kms keys add-iam-policy-binding adr-agent-key \
+  --location=us-central1 --keyring=adr-agent-ring \
+  --member=serviceAccount:service-123456789012@gcp-sa-secretmanager.iam.gserviceaccount.com \
   --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
 ```
 
 ---
 
-## 4. Artifact Registry (CMEK)
+## 3. Artifact Registry (CMEK)
 
 ```bash
-gcloud artifacts repositories create "$AR_REPO" \
+gcloud artifacts repositories create adr-agent \
   --repository-format=docker \
-  --location="$REGION" \
-  --kms-key="$KEY" \
+  --location=us-central1 \
+  --kms-key=projects/my-project-id/locations/us-central1/keyRings/adr-agent-ring/cryptoKeys/adr-agent-key \
   --description="ADR Agent container images"
 ```
 
 ---
 
-## 5. Cloud Storage (CMEK) — persistent state
+## 4. Cloud Storage (CMEK) — persistent state
 
 Cloud Run's filesystem is **ephemeral**. This bucket is mounted into the container so ADRs,
-KT documents, admin config, uploaded knowledge, and skills survive restarts.
+KT documents, admin config, and uploaded knowledge/skills survive restarts and scaling.
 
 ```bash
-gcloud storage buckets create "gs://$BUCKET" \
-  --location="$REGION" \
-  --default-encryption-key="$KEY" \
+gcloud storage buckets create gs://my-project-id-adr-agent-data \
+  --location=us-central1 \
+  --default-encryption-key=projects/my-project-id/locations/us-central1/keyRings/adr-agent-ring/cryptoKeys/adr-agent-key \
   --uniform-bucket-level-access \
   --public-access-prevention
+```
 
-# Seed the bucket with the built-in knowledge & skills so admin uploads persist alongside them
-gcloud storage cp -r backend/app/knowledge "gs://$BUCKET/knowledge"
-gcloud storage cp -r backend/app/skills    "gs://$BUCKET/skills"
+Seed the bucket with the built-in knowledge and skills so admin uploads land beside them
+(run from the repo root):
+
+```bash
+gcloud storage cp -r backend/app/knowledge gs://my-project-id-adr-agent-data/knowledge
+```
+
+```bash
+gcloud storage cp -r backend/app/skills gs://my-project-id-adr-agent-data/skills
 ```
 
 ---
 
-## 6. Secret Manager (CMEK)
-
-Never bake the Gemini key or GitHub token into the image or env vars.
+## 5. Secret Manager (CMEK)
 
 ```bash
-for S in gemini-api-key github-token; do
-  gcloud secrets create "$S" \
-    --replication-policy=user-managed \
-    --locations="$REGION" \
-    --kms-key-name="$KEY"
-done
+gcloud secrets create gemini-api-key \
+  --replication-policy=user-managed \
+  --locations=us-central1 \
+  --kms-key-name=projects/my-project-id/locations/us-central1/keyRings/adr-agent-ring/cryptoKeys/adr-agent-key
 ```
 
-Add the values **yourself** (keeps them out of shell history and CI logs):
+```bash
+gcloud secrets create github-token \
+  --replication-policy=user-managed \
+  --locations=us-central1 \
+  --kms-key-name=projects/my-project-id/locations/us-central1/keyRings/adr-agent-ring/cryptoKeys/adr-agent-key
+```
+
+Add the values interactively — paste the secret, then press **Ctrl-D**. This keeps them out of
+shell history:
 
 ```bash
-# paste value, then press Ctrl-D
 gcloud secrets versions add gemini-api-key --data-file=-
-gcloud secrets versions add github-token   --data-file=-
+```
+
+```bash
+gcloud secrets versions add github-token --data-file=-
 ```
 
 ---
 
-## 7. Service accounts (no default SAs)
+## 6. Service accounts (never the default SAs)
 
 ```bash
-gcloud iam service-accounts create "$APP-build" --display-name="ADR Agent – Cloud Build"
-gcloud iam service-accounts create "$APP-run"   --display-name="ADR Agent – Cloud Run runtime"
+gcloud iam service-accounts create adr-agent-build --display-name="ADR Agent - Cloud Build"
 ```
-
-### Cloud Build SA — least privilege (build + push only)
 
 ```bash
-# write build logs (required when using a custom SA)
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$BUILD_SA" --role=roles/logging.logWriter
-
-# push images — scoped to this repo only
-gcloud artifacts repositories add-iam-policy-binding "$AR_REPO" \
-  --location="$REGION" --member="serviceAccount:$BUILD_SA" --role=roles/artifactregistry.writer
-
-# upload build source — scoped to this bucket only
-gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
-  --member="serviceAccount:$BUILD_SA" --role=roles/storage.objectAdmin
+gcloud iam service-accounts create adr-agent-run --display-name="ADR Agent - Cloud Run runtime"
 ```
 
-> If you later want Cloud Build to **deploy** as well, add `roles/run.admin` plus
-> `roles/iam.serviceAccountUser` on `$RUN_SA`. Kept off here so the build SA can't reach production.
+### Cloud Build SA — build and push only
+
+Write build logs (required when using a custom build SA):
+
+```bash
+gcloud projects add-iam-policy-binding my-project-id \
+  --member=serviceAccount:adr-agent-build@my-project-id.iam.gserviceaccount.com \
+  --role=roles/logging.logWriter
+```
+
+Push images — scoped to this repository only:
+
+```bash
+gcloud artifacts repositories add-iam-policy-binding adr-agent \
+  --location=us-central1 \
+  --member=serviceAccount:adr-agent-build@my-project-id.iam.gserviceaccount.com \
+  --role=roles/artifactregistry.writer
+```
+
+Upload build source — scoped to this bucket only:
+
+```bash
+gcloud storage buckets add-iam-policy-binding gs://my-project-id-adr-agent-data \
+  --member=serviceAccount:adr-agent-build@my-project-id.iam.gserviceaccount.com \
+  --role=roles/storage.objectAdmin
+```
+
+> Intentionally **no** `roles/run.admin` and **no** `roles/iam.serviceAccountUser`. Cloud Build
+> cannot deploy — you do that yourself in §9.
 
 ### Cloud Run runtime SA — least privilege
 
+Read the two secrets (scoped per-secret, not project-wide):
+
 ```bash
-# read the two secrets (scoped per-secret, not project-wide)
-for S in gemini-api-key github-token; do
-  gcloud secrets add-iam-policy-binding "$S" \
-    --member="serviceAccount:$RUN_SA" --role=roles/secretmanager.secretAccessor
-done
+gcloud secrets add-iam-policy-binding gemini-api-key \
+  --member=serviceAccount:adr-agent-run@my-project-id.iam.gserviceaccount.com \
+  --role=roles/secretmanager.secretAccessor
+```
 
-# read/write the mounted bucket
-gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
-  --member="serviceAccount:$RUN_SA" --role=roles/storage.objectAdmin
+```bash
+gcloud secrets add-iam-policy-binding github-token \
+  --member=serviceAccount:adr-agent-run@my-project-id.iam.gserviceaccount.com \
+  --role=roles/secretmanager.secretAccessor
+```
 
-# application logs
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$RUN_SA" --role=roles/logging.logWriter
+Read/write the mounted bucket:
+
+```bash
+gcloud storage buckets add-iam-policy-binding gs://my-project-id-adr-agent-data \
+  --member=serviceAccount:adr-agent-run@my-project-id.iam.gserviceaccount.com \
+  --role=roles/storage.objectAdmin
+```
+
+Application logs:
+
+```bash
+gcloud projects add-iam-policy-binding my-project-id \
+  --member=serviceAccount:adr-agent-run@my-project-id.iam.gserviceaccount.com \
+  --role=roles/logging.logWriter
 ```
 
 ---
 
-## 8. Networking
+## 7. Networking
 
-### 8a. Proxy-only subnet (required by the internal ALB)
+### 7a. Confirm the existing proxy-only subnet
+
+One already exists in this network — **do not create another** (only one ACTIVE proxy-only
+subnet per region per VPC is allowed). Just confirm it is in the right region and `ACTIVE`:
 
 ```bash
-gcloud compute networks subnets create "$PROXY_SUBNET" \
-  --purpose=REGIONAL_MANAGED_PROXY \
-  --role=ACTIVE \
-  --region="$REGION" \
-  --network="$VPC" \
-  --range="$PROXY_CIDR"
+gcloud compute networks subnets list \
+  --filter="purpose=REGIONAL_MANAGED_PROXY AND region:us-central1 AND network:my-vpc" \
+  --format="table(name,region,ipCidrRange,purpose,role)"
 ```
 
-### 8b. Egress to Zscaler via the network tag
+Expect `purpose=REGIONAL_MANAGED_PROXY` and `role=ACTIVE`. Nothing references it by name — the
+internal ALB picks it up automatically for this region/VPC.
 
-Cloud Run **Direct VPC egress** supports network tags, so the same tag-based routing/firewall
-you use for VMs applies. Point the next hop at your existing Zscaler path.
+### 7b. Egress to Zscaler via the network tag
+
+Cloud Run **Direct VPC egress** supports network tags, so your existing tag-based routing and
+firewall rules apply exactly as they do for VMs.
+
+Route tagged egress to Zscaler (adjust the next hop to your environment):
 
 ```bash
-# Route tagged egress to Zscaler (adjust next-hop to your environment)
-gcloud compute routes create "$APP-zscaler-egress" \
-  --network="$VPC" \
+gcloud compute routes create adr-agent-zscaler-egress \
+  --network=my-vpc \
   --destination-range=0.0.0.0/0 \
-  --tags="$NET_TAG" \
+  --tags=zscaler-egress \
   --priority=100 \
-  --next-hop-ilb=ZSCALER_ILB_NAME --next-hop-ilb-region="$REGION"
-  # or: --next-hop-instance=ZSCALER_CONNECTOR --next-hop-instance-zone=ZONE
-
-# Allow the tagged egress
-gcloud compute firewall-rules create "$APP-allow-egress-zscaler" \
-  --network="$VPC" --direction=EGRESS --action=ALLOW \
-  --rules=tcp:443 --destination-ranges=0.0.0.0/0 --target-tags="$NET_TAG" --priority=1000
+  --next-hop-ilb=zscaler-ilb --next-hop-ilb-region=us-central1
 ```
 
-> ⚠️ **`--vpc-egress=all-traffic` sends Google API traffic through the VPC too.** The agent calls
-> `generativelanguage.googleapis.com` (Gemini). Either allowlist it in Zscaler, **or** keep Google
-> APIs on-net with Private Google Access:
-> ```bash
-> gcloud compute networks subnets update "$SUBNET" --region="$REGION" \
->   --enable-private-ip-google-access
-> gcloud compute routes create "$APP-private-googleapis" \
->   --network="$VPC" --destination-range=199.36.153.8/30 \
->   --next-hop-gateway=default-internet-gateway --tags="$NET_TAG" --priority=90
-> ```
-> (use `199.36.153.4/30` + `restricted.googleapis.com` if you're inside a VPC-SC perimeter)
-
-### 8c. Allow on-prem clients to the LB
+Allow the tagged egress:
 
 ```bash
-gcloud compute firewall-rules create "$APP-allow-onprem-to-lb" \
-  --network="$VPC" --direction=INGRESS --action=ALLOW \
-  --rules=tcp:443 --source-ranges="$ONPREM_CIDR" --priority=1000
+gcloud compute firewall-rules create adr-agent-allow-egress-zscaler \
+  --network=my-vpc \
+  --direction=EGRESS \
+  --action=ALLOW \
+  --rules=tcp:443 \
+  --destination-ranges=0.0.0.0/0 \
+  --target-tags=zscaler-egress \
+  --priority=1000
+```
+
+> ⚠️ **`--vpc-egress=all-traffic` (used in §9) sends Google API traffic through the VPC too.**
+> The agent calls `generativelanguage.googleapis.com` (Gemini). Either allowlist that in
+> Zscaler, **or** keep Google APIs on-net with Private Google Access:
+>
+> ```bash
+> gcloud compute networks subnets update my-existing-subnet \
+>   --region=us-central1 --enable-private-ip-google-access
+> ```
+>
+> ```bash
+> gcloud compute routes create adr-agent-private-googleapis \
+>   --network=my-vpc \
+>   --destination-range=199.36.153.8/30 \
+>   --next-hop-gateway=default-internet-gateway \
+>   --tags=zscaler-egress \
+>   --priority=90
+> ```
+>
+> Use `199.36.153.4/30` with `restricted.googleapis.com` if you are inside a VPC-SC perimeter.
+
+### 7c. Allow on-prem clients to reach the LB
+
+```bash
+gcloud compute firewall-rules create adr-agent-allow-onprem-to-lb \
+  --network=my-vpc \
+  --direction=INGRESS \
+  --action=ALLOW \
+  --rules=tcp:443 \
+  --source-ranges=10.0.0.0/8 \
+  --priority=1000
 ```
 
 ---
 
-## 9. Build & push the image (custom SA, never the default)
+## 8. Build and push the image (Cloud Build — build + push only)
+
+Run from the repository root. Cloud Build uses your custom service account and pushes to
+Artifact Registry. It does **not** deploy.
 
 ```bash
 gcloud builds submit \
-  --region="$REGION" \
+  --region=us-central1 \
   --config=cloudbuild.yaml \
-  --service-account="projects/$PROJECT_ID/serviceAccounts/$BUILD_SA" \
-  --gcs-source-staging-dir="gs://$BUCKET/source" \
-  --substitutions="_IMAGE=$IMAGE"
+  --service-account=projects/my-project-id/serviceAccounts/adr-agent-build@my-project-id.iam.gserviceaccount.com \
+  --gcs-source-staging-dir=gs://my-project-id-adr-agent-data/source \
+  --substitutions=_IMAGE=us-central1-docker.pkg.dev/my-project-id/adr-agent/adr-agent:v1
+```
+
+Confirm the image landed:
+
+```bash
+gcloud artifacts docker images list us-central1-docker.pkg.dev/my-project-id/adr-agent \
+  --include-tags
 ```
 
 ---
 
-## 10. Deploy Cloud Run — internal, CMEK, no public URL
+## 9. Deploy Cloud Run (you run this — internal, CMEK, no public URL)
 
 ```bash
-gcloud run deploy "$SERVICE" \
-  --image="$IMAGE" \
-  --region="$REGION" \
-  --service-account="$RUN_SA" \
-  \
-  `# --- no public exposure ---` \
+gcloud run deploy adr-agent \
+  --image=us-central1-docker.pkg.dev/my-project-id/adr-agent/adr-agent:v1 \
+  --region=us-central1 \
+  --service-account=adr-agent-run@my-project-id.iam.gserviceaccount.com \
   --ingress=internal-and-cloud-load-balancing \
   --no-default-url \
   --allow-unauthenticated \
-  \
-  `# --- CMEK ---` \
-  --encryption-key="$KEY" \
-  \
-  `# --- Direct VPC egress + network tag (Zscaler) ---` \
-  --network="$VPC" \
-  --subnet="$SUBNET" \
-  --network-tags="$NET_TAG" \
+  --encryption-key=projects/my-project-id/locations/us-central1/keyRings/adr-agent-ring/cryptoKeys/adr-agent-key \
+  --network=my-vpc \
+  --subnet=my-existing-subnet \
+  --network-tags=zscaler-egress \
   --vpc-egress=all-traffic \
-  \
-  `# --- persistent state on the CMEK bucket ---` \
-  --add-volume="name=data,type=cloud-storage,bucket=$BUCKET" \
-  --add-volume-mount="volume=data,mount-path=/data" \
-  \
-  `# --- secrets ---` \
-  --set-secrets="GOOGLE_API_KEY=gemini-api-key:latest" \
-  \
-  `# --- app config ---` \
-  --set-env-vars="LLM_PROVIDER=gemini,GEMINI_MODEL=gemini-flash-latest,ADR_OUTPUT_DIR=/data/adrs,DATA_DIR=/data/config,KNOWLEDGE_DIR=/data/knowledge,SKILLS_DIR=/data/skills" \
-  \
-  --port=8080 --cpu=1 --memory=1Gi \
-  --min-instances=1 --max-instances=4 --concurrency=80 --timeout=300
+  --add-volume=name=data,type=cloud-storage,bucket=my-project-id-adr-agent-data \
+  --add-volume-mount=volume=data,mount-path=/data \
+  --set-secrets=GOOGLE_API_KEY=gemini-api-key:latest \
+  --set-env-vars=LLM_PROVIDER=gemini,GEMINI_MODEL=gemini-flash-latest,ADR_OUTPUT_DIR=/data/adrs,DATA_DIR=/data/config,KNOWLEDGE_DIR=/data/knowledge,SKILLS_DIR=/data/skills \
+  --port=8080 \
+  --cpu=1 \
+  --memory=1Gi \
+  --min-instances=1 \
+  --max-instances=4 \
+  --concurrency=80 \
+  --timeout=300
 ```
 
-Key flags:
+What the key flags do:
+
 | Flag | Why |
 |---|---|
-| `--ingress=internal-and-cloud-load-balancing` | Not reachable from the internet; only VPC + the internal ALB |
-| `--no-default-url` | Removes the `*.run.app` URL entirely — no protocol exposed outside the LB |
+| `--ingress=internal-and-cloud-load-balancing` | Unreachable from the internet; only your VPC and the internal ALB |
+| `--no-default-url` | Removes the `*.run.app` URL entirely — no public hostname exists |
+| `--allow-unauthenticated` | An ALB cannot mint ID tokens, so IAM auth would break browser access. **Not public** — ingress is internal; the app's own login/SSO handles identity |
 | `--encryption-key` | CMEK for the service |
-| `--network-tags` | Requires Direct VPC egress; drives the Zscaler route/firewall |
+| `--network-tags` | Requires Direct VPC egress; drives the Zscaler route and firewall |
 | `--vpc-egress=all-traffic` | All egress traverses the VPC so Zscaler policy applies |
 | `--add-volume type=cloud-storage` | Persists ADRs/KT/config on the CMEK bucket |
 
 ---
 
-## 11. Internal Application Load Balancer (HTTPS)
+## 10. Internal Application Load Balancer (HTTPS only)
 
-### 11a. Certificate (Venafi-issued)
+### 10a. Certificate (Venafi-issued)
 
-Obtain the cert for `$FQDN` from Venafi, then upload as a **regional** self-managed cert.
-Include the full chain in `cert.pem` (leaf first, then intermediates).
+Obtain the certificate for `myapp.beta.matextechplus.com` from Venafi. Put the **leaf first,
+then intermediates** in `cert.pem`, and the key in `key.pem`, then upload as a **regional**
+self-managed certificate:
 
 ```bash
-gcloud compute ssl-certificates create "$APP-cert" \
+gcloud compute ssl-certificates create adr-agent-cert \
   --certificate=cert.pem \
   --private-key=key.pem \
-  --region="$REGION"
+  --region=us-central1
 ```
 
-<details><summary>Alternative: Certificate Manager + Private CA</summary>
+### 10b. Serverless NEG → Cloud Run
 
 ```bash
-gcloud privateca pools create "$APP-pool" --location="$REGION" --tier=DEVOPS
-gcloud certificate-manager certificates create "$APP-cert" \
-  --domains="$FQDN" --issuance-config=... --location="$REGION"
+gcloud compute network-endpoint-groups create adr-agent-neg \
+  --region=us-central1 \
+  --network-endpoint-type=serverless \
+  --cloud-run-service=adr-agent
 ```
-</details>
 
-### 11b. LB components
+### 10c. Backend service
 
 ```bash
-# serverless NEG → Cloud Run
-gcloud compute network-endpoint-groups create "$APP-neg" \
-  --region="$REGION" --network-endpoint-type=serverless --cloud-run-service="$SERVICE"
+gcloud compute backend-services create adr-agent-bes \
+  --region=us-central1 \
+  --load-balancing-scheme=INTERNAL_MANAGED \
+  --protocol=HTTPS
+```
 
-# backend service (internal managed)
-gcloud compute backend-services create "$APP-bes" \
-  --region="$REGION" --load-balancing-scheme=INTERNAL_MANAGED --protocol=HTTPS
+```bash
+gcloud compute backend-services add-backend adr-agent-bes \
+  --region=us-central1 \
+  --network-endpoint-group=adr-agent-neg \
+  --network-endpoint-group-region=us-central1
+```
 
-gcloud compute backend-services add-backend "$APP-bes" \
-  --region="$REGION" \
-  --network-endpoint-group="$APP-neg" --network-endpoint-group-region="$REGION"
+### 10d. URL map and HTTPS proxy
 
-# url map + https proxy
-gcloud compute url-maps create "$APP-urlmap" --default-service="$APP-bes" --region="$REGION"
-gcloud compute target-https-proxies create "$APP-proxy" \
-  --region="$REGION" --url-map="$APP-urlmap" --ssl-certificates="$APP-cert"
+```bash
+gcloud compute url-maps create adr-agent-urlmap \
+  --default-service=adr-agent-bes \
+  --region=us-central1
+```
 
-# static internal VIP in the existing subnet
-gcloud compute addresses create "$APP-vip" --region="$REGION" --subnet="$SUBNET"
-export LB_IP="$(gcloud compute addresses describe "$APP-vip" --region="$REGION" --format='value(address)')"
+```bash
+gcloud compute target-https-proxies create adr-agent-proxy \
+  --region=us-central1 \
+  --url-map=adr-agent-urlmap \
+  --ssl-certificates=adr-agent-cert
+```
 
-# forwarding rule — private VIP, HTTPS only
-gcloud compute forwarding-rules create "$APP-fr" \
-  --region="$REGION" --load-balancing-scheme=INTERNAL_MANAGED \
-  --network="$VPC" --subnet="$SUBNET" --address="$LB_IP" \
-  --target-https-proxy="$APP-proxy" --target-https-proxy-region="$REGION" \
+### 10e. Internal VIP and forwarding rule
+
+```bash
+gcloud compute addresses create adr-agent-vip \
+  --region=us-central1 \
+  --subnet=my-existing-subnet
+```
+
+```bash
+gcloud compute addresses describe adr-agent-vip \
+  --region=us-central1 --format='value(address)'
+```
+
+Use the address printed above in the next command (and again in §11):
+
+```bash
+gcloud compute forwarding-rules create adr-agent-fr \
+  --region=us-central1 \
+  --load-balancing-scheme=INTERNAL_MANAGED \
+  --network=my-vpc \
+  --subnet=my-existing-subnet \
+  --address=adr-agent-vip \
+  --target-https-proxy=adr-agent-proxy \
+  --target-https-proxy-region=us-central1 \
   --ports=443
-
-echo "LB VIP: $LB_IP"
 ```
 
-> **HTTPS only.** No HTTP forwarding rule is created, so there is no port-80 listener at all.
+> **HTTPS only.** No port-80 forwarding rule is created, so there is no HTTP listener at all.
 
 ### Do you need `--allow-global-access`?
 
-**This flag has nothing to do with public/internet access.** The VIP is a private RFC1918
-address; no external IP exists either way. The flag only controls whether clients in **other
-GCP regions** — including on-prem traffic arriving via an Interconnect/VPN attached in a
-*different* region — may reach it.
+This flag has **nothing to do with internet access** — the VIP is a private RFC1918 address
+either way. It only controls whether clients in **other GCP regions** (including on-prem
+traffic arriving via an Interconnect attached in a *different* region) can reach it.
 
-On-prem clients are treated as being in the region of their **VLAN attachment / Cloud Router**:
+On-prem clients are treated as being in the region of their VLAN attachment:
 
 ```bash
 gcloud compute interconnects attachments list --format="table(name,region,router)"
 ```
 
-| Attachment region vs `$REGION` | Action |
-|---|---|
-| **Same region** | Leave it off (as above). Least exposure. |
-| **Different region** | Add `--allow-global-access`, or on-prem traffic can't reach the VIP. |
-
-To add it later without recreating the rule:
+- Attachment region **is** `us-central1` → leave it off (as above).
+- Attachment region **is not** `us-central1` → add it, or on-prem cannot reach the VIP:
 
 ```bash
-gcloud compute forwarding-rules update "$APP-fr" --region="$REGION" --allow-global-access
+gcloud compute forwarding-rules update adr-agent-fr \
+  --region=us-central1 --allow-global-access
 ```
 
 ---
 
-## 12. DNS — `myapp.beta.matextechplus.com`
+## 11. DNS — myapp.beta.matextechplus.com
+
+Private zone visible only to the VPC:
 
 ```bash
-# private zone visible to the VPC
-gcloud dns managed-zones create "$DNS_ZONE" \
-  --dns-name="$DNS_NAME" --visibility=private --networks="$VPC" \
-  --description="Internal zone for $APP"
+gcloud dns managed-zones create matextechplus-private \
+  --dns-name=matextechplus.com. \
+  --visibility=private \
+  --networks=my-vpc \
+  --description="Internal zone for ADR Agent"
+```
 
-# A record → internal LB VIP
-gcloud dns record-sets create "$FQDN." \
-  --zone="$DNS_ZONE" --type=A --ttl=300 --rrdatas="$LB_IP"
+A record pointing at the LB VIP (substitute the address printed in §10e):
+
+```bash
+gcloud dns record-sets create myapp.beta.matextechplus.com. \
+  --zone=matextechplus-private \
+  --type=A \
+  --ttl=300 \
+  --rrdatas=10.10.0.25
 ```
 
 ### Let on-prem resolve it
-Create an **inbound** DNS forwarding entry point, then point your corporate DNS at it with a
-conditional forwarder for `matextechplus.com`.
 
 ```bash
-gcloud dns policies create "$APP-inbound" \
-  --networks="$VPC" --enable-inbound-forwarding --description="On-prem → Cloud DNS"
-
-# the IPs your on-prem resolver should forward to:
-gcloud compute addresses list --filter="purpose=DNS_RESOLVER AND region:$REGION"
+gcloud dns policies create adr-agent-inbound \
+  --networks=my-vpc \
+  --enable-inbound-forwarding \
+  --description="On-prem to Cloud DNS"
 ```
 
-*(Alternative: just add an A record for `myapp.beta` on your on-prem DNS pointing at `$LB_IP`.)*
+Get the forwarder IPs to give your corporate DNS team for a conditional forwarder on
+`matextechplus.com`:
+
+```bash
+gcloud compute addresses list --filter="purpose=DNS_RESOLVER AND region:us-central1"
+```
+
+*(Alternative: skip inbound forwarding and just add an A record for `myapp.beta` on your
+on-prem DNS pointing at the same VIP.)*
 
 ---
 
-## 13. Verify from an on-prem laptop
+## 12. Verify from an on-prem laptop
 
 ```bash
-nslookup myapp.beta.matextechplus.com          # → LB VIP
+nslookup myapp.beta.matextechplus.com
+```
+
+```bash
 curl -sS -o /dev/null -w '%{http_code}\n' https://myapp.beta.matextechplus.com/api/health
-curl -sS https://myapp.beta.matextechplus.com/api/health | jq
+```
+
+```bash
+curl -sS https://myapp.beta.matextechplus.com/api/health
 ```
 
 Then open **https://myapp.beta.matextechplus.com** in the browser and sign in.
 
-Confirm there is **no** public exposure:
-```bash
-gcloud run services describe "$SERVICE" --region="$REGION" \
-  --format='value(status.url, spec.template.metadata.annotations)'   # url should be empty
-```
-
 ---
 
-## 13b. Why the outside world cannot see this app
+## 13. Why the outside world cannot see this app
 
-Five independent layers, any one of which alone would block public access:
+Five independent layers — any one alone would block public access:
 
 | # | Layer | Effect |
 |---|---|---|
-| 1 | **No public DNS record** | The name lives only in a Cloud DNS **private** zone (`--visibility=private`). Public resolvers return NXDOMAIN for `myapp.beta.matextechplus.com`. Clicking the link from outside resolves to nothing. |
-| 2 | **Private VIP** | The LB is `INTERNAL_MANAGED` with an RFC1918 address from your subnet. No external IP is ever allocated — there is no internet-routable target. |
-| 3 | **Cloud Run ingress** | `internal-and-cloud-load-balancing` rejects anything not from your VPC or the internal LB. |
-| 4 | **No default URL** | `--no-default-url` removes the `*.run.app` hostname entirely, so the usual public backdoor doesn't exist. |
-| 5 | **Firewall** | Ingress to :443 is restricted to `$ONPREM_CIDR`. |
+| 1 | **No public DNS record** | The name exists only in a Cloud DNS **private** zone. Public resolvers return NXDOMAIN — an outsider clicking the link resolves nothing. |
+| 2 | **Private VIP** | `INTERNAL_MANAGED` with an RFC1918 address. No external IP is ever allocated. |
+| 3 | **Cloud Run ingress** | `internal-and-cloud-load-balancing` rejects anything not from the VPC or the internal LB. |
+| 4 | **No default URL** | `--no-default-url` removes the `*.run.app` hostname, so the usual public backdoor doesn't exist. |
+| 5 | **Firewall** | Ingress on :443 restricted to `10.0.0.0/8`. |
 
-⚠️ **The one thing that would break this:** if `matextechplus.com` also has a **public** Cloud DNS
-zone (or public registrar records) and someone adds `myapp.beta` there. Keep the record in the
-private zone only. Verify from outside your network:
+⚠️ **The one thing that would break this:** `matextechplus.com` is a real public domain. If a
+`myapp.beta` record is ever added to the **public** zone or registrar, layer 1 collapses. Keep
+the record in the private zone only.
+
+Verify from **off** your corporate network:
 
 ```bash
-# should return NXDOMAIN / no answer from a public resolver
 dig +short myapp.beta.matextechplus.com @8.8.8.8
-nslookup myapp.beta.matextechplus.com 1.1.1.1
 ```
 
-Also confirm the service itself has no public URL:
+Confirm the service has no public URL (output should be empty):
 
 ```bash
-gcloud run services describe "$SERVICE" --region="$REGION" --format='value(status.url)'   # empty
-gcloud compute forwarding-rules describe "$APP-fr" --region="$REGION" \
-  --format='value(loadBalancingScheme,IPAddress)'   # INTERNAL_MANAGED + private IP
+gcloud run services describe adr-agent --region=us-central1 --format='value(status.url)'
+```
+
+```bash
+gcloud compute forwarding-rules describe adr-agent-fr \
+  --region=us-central1 --format='value(loadBalancingScheme,IPAddress)'
 ```
 
 ---
 
 ## 14. Replicating in another organization
 
-Change only §1, then re-run. Watch for:
+Find-and-replace the values from the table at the top, then run the same commands. Watch for:
 
-1. **Org policies** — `run.allowedIngress` (must permit internal), `gcp.restrictNonCmekServices`,
-   `compute.restrictSharedVpcSubnetworks`, domain-restricted sharing.
-2. **Shared VPC** — if the subnet lives in a host project, run network steps there and grant
-   `roles/compute.networkUser` on the subnet to `$RUN_SA` and the Cloud Run service agent.
-3. **KMS location** must match `$REGION` for every CMEK resource.
-4. **Proxy-only subnet is one-per-region-per-VPC** — if another LB already created it, reuse it.
-5. **Zscaler next hop** differs per environment — only the route in §8b changes.
-6. **Venafi** — cert issuance/renewal process; rotate with
-   `gcloud compute target-https-proxies update ... --ssl-certificates=NEW_CERT`.
+1. **Org policies** — `run.allowedIngress` must permit internal; `gcp.restrictNonCmekServices`.
+2. **Shared VPC** — if the subnet lives in a host project, run §7 there and grant
+   `roles/compute.networkUser` on the subnet to `adr-agent-run@...` and the Cloud Run service agent.
+3. **KMS location** must match the region for every CMEK resource.
+4. **Proxy-only subnet** — confirm one exists (§7a); create it only if the other org lacks one.
+5. **Zscaler next hop** differs per environment — only the route in §7b changes.
+6. **Venafi** — certificate issuance and renewal process.
 
 ---
 
-## 15. Troubleshooting
+## 15. Updating the app later
+
+Build a new tag:
+
+```bash
+gcloud builds submit \
+  --region=us-central1 \
+  --config=cloudbuild.yaml \
+  --service-account=projects/my-project-id/serviceAccounts/adr-agent-build@my-project-id.iam.gserviceaccount.com \
+  --gcs-source-staging-dir=gs://my-project-id-adr-agent-data/source \
+  --substitutions=_IMAGE=us-central1-docker.pkg.dev/my-project-id/adr-agent/adr-agent:v2
+```
+
+Deploy it (all other settings are retained):
+
+```bash
+gcloud run services update adr-agent \
+  --region=us-central1 \
+  --image=us-central1-docker.pkg.dev/my-project-id/adr-agent/adr-agent:v2
+```
+
+Rotate the certificate:
+
+```bash
+gcloud compute target-https-proxies update adr-agent-proxy \
+  --region=us-central1 --ssl-certificates=adr-agent-cert-new
+```
+
+---
+
+## 16. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| `PERMISSION_DENIED` on deploy referencing KMS | A service agent is missing `cryptoKeyEncrypterDecrypter` (§3) |
-| Build fails: *"build must specify logs bucket"* | Custom SA without `CLOUD_LOGGING_ONLY` — it's set in `cloudbuild.yaml` |
-| Cloud Run can't reach GitHub | Route/firewall for `$NET_TAG` (§8b), or Zscaler policy |
-| Agent fails calling Gemini | `all-traffic` egress with no path to Google APIs — see the Private Google Access note in §8b |
-| LB returns 502 | Serverless NEG region mismatch, or ingress not `internal-and-cloud-load-balancing` |
-| On-prem can't reach the VIP | Missing `--allow-global-access` on the forwarding rule, or no route advertised over Interconnect |
-| ADRs disappear after a restart | Volume mount/env vars missing — `ADR_OUTPUT_DIR` must point under `/data` |
-| Cert errors in browser | `cert.pem` missing intermediates; corporate root must be trusted on the laptop |
+| `PERMISSION_DENIED` mentioning KMS | A service agent is missing `cryptoKeyEncrypterDecrypter` (§2) |
+| Build fails: *"build must specify logs bucket"* | Custom build SA without `CLOUD_LOGGING_ONLY` — already set in `cloudbuild.yaml` |
+| Cloud Run cannot reach GitHub | Route/firewall for tag `zscaler-egress` (§7b), or Zscaler policy |
+| Agent fails calling Gemini | `all-traffic` egress with no path to Google APIs — see the Private Google Access note in §7b |
+| LB returns 502 | NEG region mismatch, or ingress not `internal-and-cloud-load-balancing` |
+| On-prem cannot reach the VIP | Interconnect lands in another region — add `--allow-global-access` (§10e) |
+| ADRs disappear after a restart | Volume mount or env vars missing — `ADR_OUTPUT_DIR` must be under `/data` |
+| Browser certificate warning | `cert.pem` missing intermediates, or the corporate root is not trusted on the laptop |
 
 ---
 
-## 16. Recommended hardening (next steps)
+## 17. Recommended hardening (next steps)
 
-- **IAP** on the LB for an identity gate ahead of the app.
-- **VPC Service Controls** perimeter around Run/Storage/Artifact Registry/KMS/Secret Manager.
-- **Binary Authorization** so only Cloud Build-signed images deploy.
-- **Move GitHub/Confluence tokens** out of the admin config file into Secret Manager
-  (the app currently persists them in `app_config.json` on the CMEK bucket).
-- **Cloud Armor** is not applicable to internal ALBs; rely on firewall + on-prem controls.
+- **IAP** on the load balancer for an identity gate ahead of the app.
+- **VPC Service Controls** perimeter around Run, Storage, Artifact Registry, KMS, Secret Manager.
+- **Binary Authorization** so only Cloud Build-produced images can deploy.
+- **Move the GitHub/Confluence tokens** out of the admin config file into Secret Manager (the app
+  currently persists them in `app_config.json` on the CMEK bucket).
