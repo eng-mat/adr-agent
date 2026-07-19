@@ -15,7 +15,9 @@ from pathlib import Path
 
 import yaml
 
-SKILLS_DIR = Path(__file__).resolve().parent
+from app.config import settings
+
+SKILLS_DIR = settings.skills_path
 SCOPES = ("global", "aws", "gcp", "azure")
 
 

@@ -13,9 +13,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.config import BACKEND_DIR, settings
+from app.config import settings
 
-DATA_DIR = BACKEND_DIR / "data"
+DATA_DIR = settings.data_path
 CONFIG_PATH = DATA_DIR / "app_config.json"
 MASK = "••••••••"
 _SECRET_PATHS = (("github", "token"), ("confluence", "api_token"))

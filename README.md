@@ -70,6 +70,20 @@ npm run dev
 
 Open http://localhost:5173.
 
+## Deploying to Cloud Run (internal, CMEK)
+
+See **[docs/deploy-cloud-run.md](docs/deploy-cloud-run.md)** — a parameterized gcloud runbook for a
+hybrid/on-prem environment: internal-only Cloud Run (no public URL) behind an internal HTTPS
+Application Load Balancer, CMEK on Cloud Run / Artifact Registry / GCS / Secret Manager,
+Direct VPC egress with a network tag for Zscaler, a custom internal DNS name, and Cloud Build
+running under a dedicated least-privilege service account.
+
+The app ships as a **single container** (`Dockerfile`): the React UI is built and served by
+FastAPI alongside `/api`, so there's one service, one certificate, and no CORS. Persistent
+state (ADRs, KT docs, admin config, uploaded knowledge/skills) lives on a CMEK GCS bucket
+mounted into the container — configure via `ADR_OUTPUT_DIR`, `DATA_DIR`, `KNOWLEDGE_DIR`,
+`SKILLS_DIR`.
+
 ## Swapping to AWS Bedrock later
 
 All LLM calls go through `backend/app/llm/provider.py`. Set `LLM_PROVIDER=bedrock` in

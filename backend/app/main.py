@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from pathlib import Path
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.agent.agent import run_turn
@@ -274,3 +277,25 @@ def admin_delete_skill(scope: str, name: str, _: dict = Depends(require_admin)) 
     if not delete_skill(scope, name):
         raise HTTPException(404, f"Skill not found: {scope}/{name}")
     return {"deleted": f"{scope}/{name}"}
+
+
+# ================= static frontend (single-container deployment) =================
+# In the container image the built React app is copied to /app/static. Locally this
+# directory doesn't exist and the Vite dev server serves the UI instead, so this whole
+# block is skipped. Registered LAST so it never shadows the /api routes above.
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "static"
+
+if FRONTEND_DIR.is_dir():
+    assets = FRONTEND_DIR / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa(full_path: str):
+        # Never let the SPA fallback swallow an unknown API route.
+        if full_path.startswith("api/"):
+            raise HTTPException(404, "Not found")
+        candidate = (FRONTEND_DIR / full_path).resolve()
+        if full_path and FRONTEND_DIR.resolve() in candidate.parents and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIR / "index.html")

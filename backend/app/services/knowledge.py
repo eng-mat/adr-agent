@@ -13,7 +13,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
+from app.config import settings
+
+KNOWLEDGE_DIR = settings.knowledge_path
 SCOPES = ("global", "aws", "gcp", "azure")
 CATEGORIES = ("security", "architecture", "engineering", "general")
 

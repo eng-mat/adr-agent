@@ -1,0 +1,17 @@
+.git
+.gitignore
+.gitattributes
+README.md
+docs/
+adrs/
+gcp/
+aws/
+azure/
+backend/.venv/
+backend/.env
+backend/.local-mirror/
+backend/data/
+frontend/node_modules/
+frontend/dist/
+**/__pycache__/
+**/*.pyc

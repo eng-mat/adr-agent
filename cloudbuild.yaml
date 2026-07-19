@@ -1,0 +1,33 @@
+# Cloud Build pipeline for the ADR Agent.
+#
+# Runs under a USER-SPECIFIED service account (never the default Cloud Build SA).
+# Because a custom SA is used, logs must go to Cloud Logging explicitly, otherwise the
+# build fails with "build must specify logs bucket".
+#
+# Invoke:
+#   gcloud builds submit --region=$REGION --config=cloudbuild.yaml \
+#     --service-account=projects/$PROJECT_ID/serviceAccounts/$BUILD_SA \
+#     --gcs-source-staging-dir=gs://$BUCKET/source \
+#     --substitutions=_IMAGE=$IMAGE
+
+substitutions:
+  _IMAGE: ""            # e.g. us-central1-docker.pkg.dev/PROJECT/REPO/adr-agent:v1
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  dynamicSubstitutions: true
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}", "-f", "Dockerfile", "."]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_IMAGE}"]
+
+images:
+  - "${_IMAGE}"
+
+timeout: 1200s

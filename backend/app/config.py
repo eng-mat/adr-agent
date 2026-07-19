@@ -63,14 +63,34 @@ class Settings(BaseSettings):
     confluence_space_key: str = ""
 
     # --- Storage ---
-    adr_output_dir: str = "../adrs"
+    # All four accept absolute paths so they can point at a mounted volume
+    # (e.g. a CMEK GCS bucket on Cloud Run, whose filesystem is otherwise ephemeral).
+    adr_output_dir: str = "../adrs"       # env ADR_OUTPUT_DIR
+    data_dir: str = ""                    # env DATA_DIR       (admin runtime config)
+    knowledge_dir: str = ""               # env KNOWLEDGE_DIR  (uploaded standards)
+    skills_dir: str = ""                  # env SKILLS_DIR     (agent skills)
+
+    def _resolve(self, value: str, default: Path) -> Path:
+        if not value:
+            return default
+        p = Path(value)
+        return p if p.is_absolute() else (BACKEND_DIR / p).resolve()
 
     @property
     def adr_dir(self) -> Path:
-        p = Path(self.adr_output_dir)
-        if not p.is_absolute():
-            p = (BACKEND_DIR / p).resolve()
-        return p
+        return self._resolve(self.adr_output_dir, (BACKEND_DIR / "../adrs").resolve())
+
+    @property
+    def data_path(self) -> Path:
+        return self._resolve(self.data_dir, BACKEND_DIR / "data")
+
+    @property
+    def knowledge_path(self) -> Path:
+        return self._resolve(self.knowledge_dir, BACKEND_DIR / "app" / "knowledge")
+
+    @property
+    def skills_path(self) -> Path:
+        return self._resolve(self.skills_dir, BACKEND_DIR / "app" / "skills")
 
     @property
     def local_mirror_dir(self) -> Path:

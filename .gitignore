@@ -11,6 +11,9 @@ backend/data/
 frontend/node_modules/
 frontend/dist/
 
+# Built frontend copied into the image at build time (see Dockerfile)
+backend/static/
+
 # OS
 .DS_Store
 Thumbs.db
