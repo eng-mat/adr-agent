@@ -65,6 +65,13 @@ export const api = {
   adrKt: (uid) => req(`/adrs/${uid}/kt`).catch(() => null),
   adrDocxUrl: (uid) => `${BASE}/adrs/${uid}/export.docx`,
 
+  // lifecycle
+  statuses: () => req("/adr-statuses"),
+  setStatus: (uid, status) =>
+    req(`/adrs/${uid}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  supersede: (uid, supersedes) =>
+    req(`/adrs/${uid}/supersede`, { method: "POST", body: JSON.stringify({ supersedes }) }),
+
   // kt — keyed by the ADR's uid
   ktList: () => req("/kt"),
   saveKt: (uid, markdown) =>

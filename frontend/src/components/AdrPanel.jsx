@@ -20,6 +20,51 @@ export default function AdrPanel({ adrs, activeUid, setActiveUid, refreshAdrs })
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState(null);
 
+  // lifecycle
+  const [statuses, setStatuses] = useState([]);
+  const [showSupersede, setShowSupersede] = useState(false);
+
+  useEffect(() => {
+    api.statuses().then((r) => setStatuses(r.statuses)).catch(() => {});
+  }, []);
+
+  // earlier ADRs for the same service that this one could supersede
+  const supersedable = adr
+    ? adrs.filter(
+        (a) =>
+          a.cloud === adr.cloud &&
+          a.service === adr.service &&
+          a.uid !== adr.uid &&
+          (a.number ?? 0) < (adr.number ?? 0)
+      )
+    : [];
+  const byUid = Object.fromEntries(adrs.map((a) => [a.uid, a]));
+
+  async function changeStatus(status) {
+    setSaveMsg(null);
+    try {
+      const updated = await api.setStatus(activeUid, status);
+      setAdr(updated);
+      await refreshAdrs();
+    } catch (e) {
+      setSaveMsg(`Status change failed: ${e.message}`);
+    }
+  }
+
+  async function doSupersede(oldUid) {
+    setSaveMsg(null);
+    setShowSupersede(false);
+    try {
+      const updated = await api.supersede(activeUid, oldUid);
+      setAdr(updated);
+      await refreshAdrs();
+      setSaveMsg("Superseded");
+      setTimeout(() => setSaveMsg(null), 2500);
+    } catch (e) {
+      setSaveMsg(`Supersede failed: ${e.message}`);
+    }
+  }
+
   useEffect(() => {
     if (!activeUid) {
       setAdr(null);
@@ -119,8 +164,11 @@ export default function AdrPanel({ adrs, activeUid, setActiveUid, refreshAdrs })
                 <span className="adr-id">{a.id}</span>
                 <span className={`cloud-tag ${a.cloud}`}>{cloudLabel[a.cloud] || a.cloud}</span>
               </div>
-              <div className="adr-title">{a.title}</div>
-              <div className="adr-path">{a.folder}</div>
+              <div className={`adr-title ${a.superseded_by ? "struck" : ""}`}>{a.title}</div>
+              <div className="adr-row-bottom">
+                <span className="adr-path">{a.folder}</span>
+                <span className={`status-dot-sm ${a.status?.toLowerCase()}`}>{a.status}</span>
+              </div>
             </li>
           ))}
         </ul>
@@ -156,7 +204,19 @@ export default function AdrPanel({ adrs, activeUid, setActiveUid, refreshAdrs })
             <div className="preview-toolbar">
               <div className="doc-ident">
                 <span className="adr-id big">{docView === "kt" ? kt?.id : adr.id}</span>
-                {docView === "adr" && (
+                {docView === "adr" && !editing && (
+                  <select
+                    className={`status-select ${adr.status?.toLowerCase()}`}
+                    value={adr.status}
+                    onChange={(e) => changeStatus(e.target.value)}
+                    title="Change status"
+                  >
+                    {statuses.map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                )}
+                {docView === "kt" && (
                   <span className={`status-pill ${adr.status?.toLowerCase()}`}>{adr.status}</span>
                 )}
                 <span className="uid-tag" title="Unique key — display IDs restart per service">
@@ -175,6 +235,14 @@ export default function AdrPanel({ adrs, activeUid, setActiveUid, refreshAdrs })
                   <>
                     <button onClick={startEdit} title="Edit this document">✎ Edit</button>
                     <button onClick={downloadDocx} title="Download as Word">⬇ Word</button>
+                    {docView === "adr" && supersedable.length > 0 && (
+                      <button
+                        onClick={() => setShowSupersede((v) => !v)}
+                        title="Mark an earlier ADR for this service as superseded by this one"
+                      >
+                        ⤴ Supersede
+                      </button>
+                    )}
                     {docView === "adr" && (
                       <>
                         <button disabled={publishing} onClick={() => publish(["github"])}>GitHub</button>
@@ -189,8 +257,49 @@ export default function AdrPanel({ adrs, activeUid, setActiveUid, refreshAdrs })
               </div>
             </div>
 
+            {showSupersede && (
+              <div className="supersede-picker">
+                <div className="supersede-title">
+                  Which earlier {adr.service} ADR does <strong>{adr.id}</strong> replace?
+                </div>
+                {supersedable.map((a) => (
+                  <button key={a.uid} className="supersede-option" onClick={() => doSupersede(a.uid)}>
+                    <span className="adr-id">{a.id}</span>
+                    <span className="supersede-opt-title">{a.title}</span>
+                    <span className={`status-pill ${a.status?.toLowerCase()}`}>{a.status}</span>
+                  </button>
+                ))}
+                <button className="supersede-cancel" onClick={() => setShowSupersede(false)}>
+                  Cancel
+                </button>
+              </div>
+            )}
+
+            {docView === "adr" && (adr.superseded_by || adr.supersedes) && (
+              <div className="lineage">
+                {adr.superseded_by && (
+                  <button
+                    className="lineage-badge superseded"
+                    onClick={() => setActiveUid(adr.superseded_by)}
+                    title="Open the ADR that replaced this one"
+                  >
+                    ⚠️ Superseded by {byUid[adr.superseded_by]?.id || adr.superseded_by} →
+                  </button>
+                )}
+                {adr.supersedes && (
+                  <button
+                    className="lineage-badge supersedes"
+                    onClick={() => setActiveUid(adr.supersedes)}
+                    title="Open the ADR this one replaced"
+                  >
+                    ↩️ Supersedes {byUid[adr.supersedes]?.id || adr.supersedes} →
+                  </button>
+                )}
+              </div>
+            )}
+
             {saveMsg && (
-              <div className={`save-flag ${saveMsg.startsWith("Save failed") ? "err" : "ok"}`}>
+              <div className={`save-flag ${saveMsg.includes("failed") ? "err" : "ok"}`}>
                 {saveMsg}
               </div>
             )}

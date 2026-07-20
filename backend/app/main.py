@@ -48,6 +48,14 @@ class DocumentEdit(BaseModel):
     markdown: str
 
 
+class StatusChange(BaseModel):
+    status: str
+
+
+class SupersedeRequest(BaseModel):
+    supersedes: str  # uid of the earlier ADR being replaced
+
+
 class LoginRequest(BaseModel):
     email: str
     name: str = ""
@@ -151,6 +159,34 @@ def edit_adr(uid: str, req: DocumentEdit) -> dict:
     adr = storage.update_adr(uid, req.markdown)
     if not adr:
         raise HTTPException(404, f"ADR not found: {uid}")
+    return adr
+
+
+@app.get("/api/adr-statuses")
+def get_statuses() -> dict:
+    return {"statuses": list(storage.STATUSES)}
+
+
+@app.patch("/api/adrs/{uid}/status")
+def change_status(uid: str, req: StatusChange) -> dict:
+    try:
+        adr = storage.set_status(uid, req.status)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not adr:
+        raise HTTPException(404, f"ADR not found: {uid}")
+    return adr
+
+
+@app.post("/api/adrs/{uid}/supersede")
+def supersede_adr(uid: str, req: SupersedeRequest) -> dict:
+    """`uid` (the newer ADR) supersedes `req.supersedes` (the earlier one)."""
+    try:
+        adr = storage.supersede(uid, req.supersedes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not adr:
+        raise HTTPException(404, "ADR not found")
     return adr
 
 
