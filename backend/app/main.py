@@ -40,8 +40,12 @@ class ChatRequest(BaseModel):
 
 
 class PublishRequest(BaseModel):
-    adr_id: str
+    adr_id: str  # the ADR's uid (display ids repeat per service)
     targets: list[str] = ["github", "confluence"]
+
+
+class DocumentEdit(BaseModel):
+    markdown: str
 
 
 class LoginRequest(BaseModel):
@@ -133,59 +137,71 @@ def list_adrs() -> dict:
     return {"adrs": storage.list_adrs()}
 
 
-@app.get("/api/adrs/{adr_id}")
-def get_adr(adr_id: str) -> dict:
-    adr = storage.read_adr(adr_id)
+@app.get("/api/adrs/{uid}")
+def get_adr(uid: str) -> dict:
+    adr = storage.read_adr(uid)
     if not adr:
-        raise HTTPException(404, f"ADR not found: {adr_id}")
+        raise HTTPException(404, f"ADR not found: {uid}")
     return adr
 
 
-@app.get("/api/adrs/{adr_id}/export.docx")
-def export_adr_docx(adr_id: str):
-    adr = storage.read_adr(adr_id)
+@app.put("/api/adrs/{uid}")
+def edit_adr(uid: str, req: DocumentEdit) -> dict:
+    """Inline editing — overwrite the ADR's markdown before publishing."""
+    adr = storage.update_adr(uid, req.markdown)
     if not adr:
-        raise HTTPException(404, f"ADR not found: {adr_id}")
+        raise HTTPException(404, f"ADR not found: {uid}")
+    return adr
+
+
+@app.get("/api/adrs/{uid}/export.docx")
+def export_adr_docx(uid: str):
+    adr = storage.read_adr(uid)
+    if not adr:
+        raise HTTPException(404, f"ADR not found: {uid}")
     data = markdown_to_docx_bytes(adr["markdown"], adr["title"])
+    filename = f"{adr['id']}-{adr['cloud']}-{adr['service']}.docx"
     return Response(
         content=data,
         media_type=DOCX_MEDIA,
-        headers={"Content-Disposition": f'attachment; filename="{adr_id}.docx"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
-# ---------- KT documents ----------
+# ---------- KT documents (keyed by the ADR's uid) ----------
 @app.get("/api/kt")
 def list_kt() -> dict:
     return {"kt": kt.list_kt()}
 
 
-@app.get("/api/kt/{kt_id}")
-def get_kt(kt_id: str) -> dict:
-    doc = kt.read_kt(kt_id)
+@app.get("/api/adrs/{uid}/kt")
+def get_adr_kt(uid: str) -> dict:
+    doc = kt.read_kt_for_adr(uid)
     if not doc:
-        raise HTTPException(404, f"KT not found: {kt_id}")
+        raise HTTPException(404, f"No KT for {uid}")
     return doc
 
 
-@app.get("/api/adrs/{adr_id}/kt")
-def get_adr_kt(adr_id: str) -> dict:
-    doc = kt.read_kt_for_adr(adr_id)
+@app.put("/api/kt/{uid}")
+def edit_kt(uid: str, req: DocumentEdit) -> dict:
+    """Inline editing — overwrite the KT document's markdown."""
+    doc = kt.update_kt(uid, req.markdown)
     if not doc:
-        raise HTTPException(404, f"No KT for {adr_id}")
+        raise HTTPException(404, f"KT not found for {uid}")
     return doc
 
 
-@app.get("/api/kt/{kt_id}/export.docx")
-def export_kt_docx(kt_id: str):
-    doc = kt.read_kt(kt_id)
+@app.get("/api/kt/{uid}/export.docx")
+def export_kt_docx(uid: str):
+    doc = kt.read_kt_for_adr(uid)
     if not doc:
-        raise HTTPException(404, f"KT not found: {kt_id}")
+        raise HTTPException(404, f"KT not found for {uid}")
     data = markdown_to_docx_bytes(doc["markdown"], doc["title"])
+    filename = f"{doc['id']}-{doc['cloud']}.docx"
     return Response(
         content=data,
         media_type=DOCX_MEDIA,
-        headers={"Content-Disposition": f'attachment; filename="{kt_id}.docx"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

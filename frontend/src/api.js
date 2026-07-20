@@ -57,16 +57,19 @@ export const api = {
   login: (email, name, role) =>
     req("/auth/login", { method: "POST", body: JSON.stringify({ email, name, role }) }),
 
-  // adrs
+  // adrs — keyed by uid (display ids repeat per service)
   adrs: () => req("/adrs"),
-  adr: (id) => req(`/adrs/${id}`),
-  adrKt: (id) => req(`/adrs/${id}/kt`).catch(() => null),
-  adrDocxUrl: (id) => `${BASE}/adrs/${id}/export.docx`,
+  adr: (uid) => req(`/adrs/${uid}`),
+  saveAdr: (uid, markdown) =>
+    req(`/adrs/${uid}`, { method: "PUT", body: JSON.stringify({ markdown }) }),
+  adrKt: (uid) => req(`/adrs/${uid}/kt`).catch(() => null),
+  adrDocxUrl: (uid) => `${BASE}/adrs/${uid}/export.docx`,
 
-  // kt
+  // kt — keyed by the ADR's uid
   ktList: () => req("/kt"),
-  kt: (id) => req(`/kt/${id}`),
-  ktDocxUrl: (id) => `${BASE}/kt/${id}/export.docx`,
+  saveKt: (uid, markdown) =>
+    req(`/kt/${uid}`, { method: "PUT", body: JSON.stringify({ markdown }) }),
+  ktDocxUrl: (uid) => `${BASE}/kt/${uid}/export.docx`,
 
   // agent
   chat: (message, history) =>

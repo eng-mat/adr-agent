@@ -1,8 +1,12 @@
 """Knowledge Transfer (KT) documents.
 
 Every ADR (automation document) produced by Cloud Engineering is accompanied by a KT
-document that hands the resource over to **Cloud Operations**: what was built, how it's
-operated, and how to escalate. KT docs live in a parallel tree and share the ADR's number.
+document handing the resource over to **Cloud Operations**: what was built, how it's
+operated, and how to escalate.
+
+KT docs mirror the ADR's per-service numbering — `KT-0001` belongs to that service's
+`ADR-0001`. Records are keyed by the ADR's `uid` (e.g. `gcp-gcs-0001`), since the display
+id repeats across services.
 
 Layout:  <ADR_OUTPUT_DIR>/kt/<cloud>/<service-folder>/KT-XXXX-<slug>.md
 Index:   <ADR_OUTPUT_DIR>/kt/index.json
@@ -20,7 +24,8 @@ from app.services.adr_builder import ADRContent
 
 @dataclass
 class KTDoc:
-    id: str
+    uid: str          # the ADR's uid — KT is 1:1 with its ADR
+    id: str           # display id, e.g. "KT-0001"
     adr_id: str
     title: str
     cloud: str
@@ -44,6 +49,7 @@ def kt_root() -> Path:
 
 def generate(
     *,
+    adr_uid: str,
     adr_id: str,
     adr_title: str,
     adr_rel_path: str,
@@ -137,7 +143,8 @@ category: {category}
 """
     path.write_text(md, encoding="utf-8")
 
-    kt = KTDoc(
+    doc = KTDoc(
+        uid=adr_uid,
         id=kt_id,
         adr_id=adr_id,
         title=f"KT — {adr_title}",
@@ -147,45 +154,68 @@ category: {category}
         rel_path=f"kt/{folder_rel}/{filename}",
         path=str(path),
     )
-    _append_index(kt)
-    return kt
+    _append_index(doc)
+    return doc
 
 
-def _append_index(kt: KTDoc) -> None:
-    index_path = kt_root() / "index.json"
-    entries: list[dict] = []
-    if index_path.exists():
-        try:
-            entries = json.loads(index_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            entries = []
-    entries = [e for e in entries if e.get("id") != kt.id]
-    entries.append(asdict(kt))
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+def _index_path() -> Path:
+    return kt_root() / "index.json"
+
+
+def _read_index() -> list[dict]:
+    p = _index_path()
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+
+def _write_index(entries: list[dict]) -> None:
+    p = _index_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+
+def _append_index(doc: KTDoc) -> None:
+    entries = [e for e in _read_index() if e.get("uid") != doc.uid]
+    entries.append(asdict(doc))
+    _write_index(entries)
 
 
 def list_kt() -> list[dict]:
-    index_path = kt_root() / "index.json"
-    if not index_path.exists():
-        return []
-    try:
-        entries = json.loads(index_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
-    return sorted(entries, key=lambda e: e.get("id", ""), reverse=True)
+    return sorted(_read_index(), key=lambda e: (e.get("date", ""), e.get("uid", "")), reverse=True)
 
 
-def read_kt(kt_id: str) -> dict | None:
-    for entry in list_kt():
-        if entry.get("id") == kt_id:
-            p = Path(entry["path"])
-            if p.exists():
-                entry = dict(entry)
-                entry["markdown"] = p.read_text(encoding="utf-8")
-                return entry
+def _find_entry(adr_uid: str) -> dict | None:
+    for e in _read_index():
+        if e.get("uid") == adr_uid:
+            return e
+    for e in _read_index():  # legacy records keyed by display id
+        if e.get("id") == adr_uid or e.get("adr_id") == adr_uid:
+            return e
     return None
 
 
-def read_kt_for_adr(adr_id: str) -> dict | None:
-    return read_kt(adr_id.replace("ADR-", "KT-"))
+def read_kt_for_adr(adr_uid: str) -> dict | None:
+    entry = _find_entry(adr_uid)
+    if not entry:
+        return None
+    p = Path(entry["path"])
+    if not p.exists():
+        return None
+    out = dict(entry)
+    out["markdown"] = p.read_text(encoding="utf-8")
+    return out
+
+
+def update_kt(adr_uid: str, markdown: str) -> dict | None:
+    """Overwrite a KT document's markdown (inline editing)."""
+    entry = _find_entry(adr_uid)
+    if not entry:
+        return None
+    p = Path(entry["path"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(markdown, encoding="utf-8")
+    return read_kt_for_adr(adr_uid)

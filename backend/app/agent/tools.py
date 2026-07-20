@@ -165,6 +165,7 @@ def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
             content=content,
         )
         return {
+            "uid": saved.uid,
             "id": saved.id,
             "title": saved.title,
             "cloud": saved.cloud,

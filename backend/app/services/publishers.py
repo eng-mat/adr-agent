@@ -30,10 +30,11 @@ class PublishResult:
     url: str | None = None
 
 
-def publish_github(adr_id: str) -> PublishResult:
-    adr = read_adr(adr_id)
+def publish_github(adr_key: str) -> PublishResult:
+    """`adr_key` is the ADR's uid (e.g. gcp-gcs-0001); display ids repeat per service."""
+    adr = read_adr(adr_key)
     if not adr:
-        return PublishResult("github", "stub", False, f"ADR {adr_id} not found")
+        return PublishResult("github", "stub", False, f"ADR {adr_key} not found")
 
     gh = config_store.effective()["github"]
     branch = gh.get("branch") or "main"
@@ -72,7 +73,7 @@ def publish_github(adr_id: str) -> PublishResult:
         if existing.status_code == 200:
             sha = existing.json().get("sha")
         body = {
-            "message": f"Add {adr_id}: {adr['title']}",
+            "message": f"Add {adr['id']} ({adr['cloud']}/{adr['service']}): {adr['title']}",
             "content": content_b64,
             "branch": branch,
         }
@@ -87,14 +88,15 @@ def publish_github(adr_id: str) -> PublishResult:
     )
 
 
-def publish_confluence(adr_id: str) -> PublishResult:
-    adr = read_adr(adr_id)
+def publish_confluence(adr_key: str) -> PublishResult:
+    """`adr_key` is the ADR's uid (e.g. gcp-gcs-0001); display ids repeat per service."""
+    adr = read_adr(adr_key)
     if not adr:
-        return PublishResult("confluence", "stub", False, f"ADR {adr_id} not found")
+        return PublishResult("confluence", "stub", False, f"ADR {adr_key} not found")
 
     conf = config_store.effective()["confluence"]
     if not config_store.confluence_configured():
-        dest = settings.local_mirror_dir / "confluence" / f"{adr_id}.html"
+        dest = settings.local_mirror_dir / "confluence" / f"{adr.get('uid', adr_key)}.html"
         dest.parent.mkdir(parents=True, exist_ok=True)
         html = _markdown_to_storage_html(adr["markdown"])
         dest.write_text(html, encoding="utf-8")
@@ -117,7 +119,9 @@ def publish_confluence(adr_id: str) -> PublishResult:
     html = _markdown_to_storage_html(adr["markdown"])
     payload = {
         "spaceKey": conf["space_key"],
-        "title": f"{adr_id}: {adr['title']}",
+        # Confluence page titles must be unique in a space, and display ids now repeat
+        # across services — qualify with cloud/service.
+        "title": f"{adr['id']} · {adr['cloud']}/{adr['service']} — {adr['title']}",
         "type": "page",
         "body": {"storage": {"value": html, "representation": "storage"}},
     }

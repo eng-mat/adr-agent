@@ -9,6 +9,7 @@ of messages + a list of tools), because Bedrock's Anthropic models accept the sa
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -155,15 +156,40 @@ class GeminiProvider:
             ]
             body["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
 
-        with httpx.Client(timeout=90) as client:
-            resp = client.post(
-                self._url, headers={"x-goog-api-key": self._key}, json=body
-            )
-        if resp.status_code != 200:
+        # Free-tier quotas are low (a handful of requests per minute), and the agent loop
+        # makes several calls per turn. Retry 429/5xx with exponential backoff, honouring
+        # Retry-After when the API supplies it.
+        delay = 2.0
+        last: httpx.Response | None = None
+        for attempt in range(4):
+            with httpx.Client(timeout=90) as client:
+                resp = client.post(
+                    self._url, headers={"x-goog-api-key": self._key}, json=body
+                )
+            if resp.status_code == 200:
+                return _from_gemini_response(resp.json())
+            last = resp
+            if resp.status_code not in (429, 500, 502, 503, 504) or attempt == 3:
+                break
+            wait = delay
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait = max(wait, float(retry_after))
+                except ValueError:
+                    pass
+            time.sleep(wait)
+            delay *= 2
+
+        assert last is not None
+        if last.status_code == 429:
             raise RuntimeError(
-                f"Gemini API error {resp.status_code}: {resp.text[:400]}"
+                "Gemini rate limit reached (free tier allows only a few requests per "
+                "minute, and each ADR takes several). Wait a moment and try again, or "
+                "enable billing / switch GEMINI_MODEL. "
+                f"Details: {last.text[:200]}"
             )
-        return _from_gemini_response(resp.json())
+        raise RuntimeError(f"Gemini API error {last.status_code}: {last.text[:400]}")
 
 
 # ---- Gemini <-> Anthropic translation helpers ----

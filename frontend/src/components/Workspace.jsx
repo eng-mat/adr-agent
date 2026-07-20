@@ -23,7 +23,7 @@ export default function Workspace({ health }) {
   const [knowledge, setKnowledge] = useState([]);
   const [references, setReferences] = useState([]);
   const [adrs, setAdrs] = useState([]);
-  const [activeAdrId, setActiveAdrId] = useState(null);
+  const [activeUid, setActiveUid] = useState(null);
   const [seed, setSeed] = useState(null);
 
   const [panes, setPanes] = useState(loadPanes());
@@ -89,7 +89,7 @@ export default function Workspace({ health }) {
   const onSaved = useCallback(
     async (saved) => {
       await refreshAdrs();
-      if (saved && saved.length) setActiveAdrId(saved[saved.length - 1].id);
+      if (saved && saved.length) setActiveUid(saved[saved.length - 1].uid);
     },
     [refreshAdrs]
   );
@@ -140,8 +140,8 @@ export default function Workspace({ health }) {
         <div className="pane pane-right" style={rightStyle}>
           <AdrPanel
             adrs={adrs}
-            activeAdrId={activeAdrId}
-            setActiveAdrId={setActiveAdrId}
+            activeUid={activeUid}
+            setActiveUid={setActiveUid}
             refreshAdrs={refreshAdrs}
           />
         </div>
