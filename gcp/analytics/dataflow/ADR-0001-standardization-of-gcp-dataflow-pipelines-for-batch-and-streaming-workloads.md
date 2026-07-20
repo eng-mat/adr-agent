@@ -1,5 +1,4 @@
 ---
-Testing
 id: ADR-0001
 title: Standardization of GCP Dataflow Pipelines for Batch and Streaming Workloads
 status: Accepted
@@ -24,7 +23,7 @@ tags: []
 
 ## Context
 
-The organization requires a unified, scalable, and secure data processing framework to handle both batch and streaming data pipelines across all environments (dev, qa, preprod, prod, and dr). These pipelines must ingest from and write to various sources and sinks (such as Pub/Sub, BigQuery, Cloud Storage, and Cloud Spanner) while adhering to strict enterprise security, network isolation, and encryption compliance standards.
+The organization requires a unified, scalable, and secure data processing framework to handle both batch and streaming data pipelines across all environments (dev, qa, preprod, prod, and dr). These pipelines must ingest from and write to various sources and sinks (such as Pub/Sub, BigQuery, Cloud Storage, and Cloud Spanner) while adhering to strict enterprise security, network isolation, and encryption compliance standards. TESTING
 
 ## Decision
 
